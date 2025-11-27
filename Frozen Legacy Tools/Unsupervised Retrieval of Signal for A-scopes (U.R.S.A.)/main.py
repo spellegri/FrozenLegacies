@@ -53,7 +53,7 @@ def load_navigation_file(nav_path):
         return {}
 
 
-def process_batch_folder(folder_path, nav_path=None, config_path=None, output_dir=None):
+def process_batch_folder(folder_path, nav_path=None, config_path=None, output_dir=None, interactive_approval=True):
     """
     Process all TIFF files in a folder with optional navigation data.
     
@@ -95,6 +95,8 @@ def process_batch_folder(folder_path, nav_path=None, config_path=None, output_di
             # Set navigation data if available
             if nav_dict:
                 processor.nav_dict = nav_dict
+            # Enable interactive approval flow for this processor if requested
+            processor.set_interactive_mode(enabled=bool(interactive_approval), defer_frame_plots=bool(interactive_approval))
             
             # Process the image
             processor.process_image(str(tiff_file), output_dir)
@@ -300,6 +302,18 @@ Interactive Override (single file only):
         "Allows manual correction of automatic transmitter, surface, and bed picks.",
     )
 
+    parser.add_argument(
+        "--interactive-approval",
+        action="store_true",
+        help="Enable interactive montage approval for batch runs (prompts per-file).",
+    )
+
+    parser.add_argument(
+        "--no-approve",
+        action="store_true",
+        help="Disable interactive approval for single-file runs (non-interactive).",
+    )
+
     args = parser.parse_args()
 
     # Determine processing mode
@@ -356,6 +370,8 @@ Interactive Override (single file only):
         print(f"Mode: BATCH PROCESSING")
         print(f"Input folder: {folder_path.resolve()}")
         print(f"Navigation file: {args.nav if args.nav else 'None'}")
+        effective_interactive = not args.no_approve
+        print(f"Interactive approval: {'Enabled' if effective_interactive else 'Disabled'} (use --no-approve to disable)")
     else:
         print(f"Mode: SINGLE FILE PROCESSING")
         print(f"Input file: {input_path.resolve()}")
@@ -403,6 +419,7 @@ Interactive Override (single file only):
                 args.nav,
                 str(config_path.resolve()),
                 str(output_path.resolve()) if output_path else None,
+                interactive_approval=(not args.no_approve),
             )
             
             if success:
@@ -453,6 +470,9 @@ Interactive Override (single file only):
             # Set output directory if specified
             if output_path:
                 processor.set_output_directory(str(output_path.resolve()))
+
+            # Enable or disable interactive approval flow for single-file processing
+            processor.set_interactive_mode(enabled=not args.no_approve, defer_frame_plots=not args.no_approve)
 
             # Process the image
             print(f"INFO: Starting processing of {input_path.name}...")

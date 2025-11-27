@@ -394,27 +394,27 @@ class EchoPointSelector:
             bbox=dict(boxstyle="round,pad=0.5", facecolor="lightblue", alpha=0.9),
         )
 
-        def _check_completion(self):
-            """Check if enough points have been selected."""
-            surface_count = len(self.surface_points)
-            bed_count = len(self.bed_points)
+    def _check_completion(self):
+        """Check if enough points have been selected."""
+        surface_count = len(self.surface_points)
+        bed_count = len(self.bed_points)
 
-            if (
-                surface_count >= self.expected_points
-                and bed_count >= self.expected_points
-            ):
-                print(
-                    f"\nSUCCESS: Selected {surface_count} surface and {bed_count} bed points"
-                )
-                print("You can close the window or press 'Q' to finish selection")
+        if (
+            surface_count >= self.expected_points
+            and bed_count >= self.expected_points
+        ):
+            print(
+                f"\nSUCCESS: Selected {surface_count} surface and {bed_count} bed points"
+            )
+            print("You can close the window or press 'Q' to finish selection")
 
-                self.ax.set_title(
-                    f"{self.title}\nCOMPLETE: {surface_count} surface, {bed_count} bed points selected",
-                    fontsize=16,
-                    fontweight="bold",
-                    color="green",
-                )
-                self.fig.canvas.draw()
+            self.ax.set_title(
+                f"{self.title}\nCOMPLETE: {surface_count} surface, {bed_count} bed points selected",
+                fontsize=16,
+                fontweight="bold",
+                color="green",
+            )
+            self.fig.canvas.draw()
 
     def cleanup(self):
         """Clean up event connections."""

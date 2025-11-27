@@ -62,15 +62,23 @@ def detect_grid_lines_and_dotted(frame, config, qa_plot_path=None, ref_row_for_q
         print("No significant grid tilt detected")
 
     # STEP 2: Detect signal extent
-    _, signal_mask = cv2.threshold(rotated_frame, 150, 255, cv2.THRESH_BINARY_INV)
+    # Threshold to get candidate signal mask; threshold pulled from config for flexibility
+    signal_mask_thresh = get_param(
+        config, "processing_params", "signal_mask_thresh", 150
+    )
+    _, signal_mask = cv2.threshold(
+        rotated_frame, signal_mask_thresh, 255, cv2.THRESH_BINARY_INV
+    )
     contours, _ = cv2.findContours(
         signal_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
     )
 
     signal_x_min, signal_y_min = w, h
     signal_x_max, signal_y_max = 0, 0
+    # Use config-driven minimum area for filtering contours
+    min_area = get_param(config, "processing_params", "signal_extent_min_area", 100)
     for contour in contours:
-        if cv2.contourArea(contour) > 100:  # Filter out small noise
+        if cv2.contourArea(contour) >= min_area:  # Filter out small noise
             x, y, width, height = cv2.boundingRect(contour)
             signal_x_min = min(signal_x_min, x)
             signal_y_min = min(signal_y_min, y)
@@ -467,10 +475,10 @@ def detect_grid_lines_and_dotted(frame, config, qa_plot_path=None, ref_row_for_q
 
         plt.tight_layout()
 
-        # Get plot DPI from config or use default
+        # Save projection plot via save_plot to respect config output_dir and DPI
         output_config = config.get("output", {})
-        dpi = output_config.get("plot_dpi", 150)
-        save_plot(plt.gcf(), os.path.basename(qa_plot_path), dpi=dpi)
+        plot_dpi = output_config.get("plot_dpi", 150)
+        save_plot(plt.gcf(), os.path.basename(qa_plot_path), dpi=plot_dpi)
 
     # Return detected peaks for grid interpolation
     return h_peaks_final, v_peaks_final, h_minor_peaks, v_minor_peaks
@@ -763,7 +771,7 @@ def find_reference_line_blackhat(frame, base_filename, frame_idx, config):
 
             # Get prominences if available, otherwise use height as proxy
             if "prominences" in properties:
-                if len(properties["prominences"]) == len(peaks):
+                if len(properties.get("prominences", [])) == len(peaks):
                     valid_peaks_prominences = properties["prominences"][
                         valid_peak_indices_in_peaks
                     ]
@@ -873,7 +881,15 @@ def find_reference_line_blackhat(frame, base_filename, frame_idx, config):
         plt.ylabel("Summed Pixel Value (Normalized)")
         plt.legend(fontsize=8)
         plt.grid(True)
-        plt.savefig(f"{qa_base}_05_projection.png", dpi=150)
+        # Save using configured DPI and helper to ensure output dir handling
+        output_config = config.get("output", {})
+        plot_dpi = output_config.get("plot_dpi", 150)
+        
+        # Only save projection plot if save_grid_qa is enabled
+        if output_config.get("save_grid_qa", False):
+            save_plot(plt.gcf(), os.path.basename(f"{qa_base}_05_projection.png"), dpi=plot_dpi)
+
+        # Close the figure to prevent it from displaying in interactive mode
         plt.close()
 
         print(f"Saved reference line intermediate QA images to {qa_output_dir}")

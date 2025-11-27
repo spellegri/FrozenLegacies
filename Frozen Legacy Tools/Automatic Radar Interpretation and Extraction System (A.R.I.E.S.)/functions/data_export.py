@@ -87,17 +87,28 @@ def export_ice_measurements(
     else:
         raise ValueError(f"Unknown coordinate_system: {coordinate_system}")
 
-    # Calculate travel times (in microseconds)
-    # Travel time = (echo_y_abs - transmitter_pulse_y_abs) / pixels_per_microsecond
+    # Calculate two-way travel times (in microseconds) using calpip-based calibration like TERRA
+    # Two-way travel time = (echo_y_abs - transmitter_pulse_y_abs) * us_per_pixel
+    # where us_per_pixel is derived from calpip spacing (2 μs between calpip lines)
+    
+    # Use calpip-based calibration like TERRA (2 μs spacing between calibration pip lines)
+    if hasattr(processor, 'calpip_pixel_distance') and processor.calpip_pixel_distance and processor.calpip_pixel_distance > 0:
+        us_per_pixel = 2.0 / processor.calpip_pixel_distance  # TERRA's method: 2 μs between calpip lines
+    else:
+        # Fallback to old method if no calpip data available
+        us_per_pixel = 1.0 / processor.pixels_per_microsecond
+        print("WARNING: No calpip calibration available, using fallback pixels_per_microsecond")
+    
     surface_travel_time_us = (
         surface_y_abs - processor.transmitter_pulse_y_abs
-    ) / processor.pixels_per_microsecond
+    ) * us_per_pixel
     bed_travel_time_us = (
         bed_y_abs - processor.transmitter_pulse_y_abs
-    ) / processor.pixels_per_microsecond
+    ) * us_per_pixel
 
-    # Calculate depths (in meters)
-    # For radar: depth = (two_way_travel_time/2 * wave_velocity)
+    # Calculate depths (in meters) using two-way travel time like TERRA
+    # For radar: depth = (two_way_travel_time / 2) * wave_velocity
+    # Travel times are already two-way, so divide by 2 to get one-way, then multiply by velocity
     surface_depth_m = (surface_travel_time_us * 1e-6) / 2 * wave_velocity_ice
     bed_depth_m = (bed_travel_time_us * 1e-6) / 2 * wave_velocity_ice
 
@@ -110,8 +121,16 @@ def export_ice_measurements(
     surface_depth_m = np.where(surface_depth_m < 0, np.nan, surface_depth_m)
     bed_depth_m = np.where(bed_depth_m < 0, np.nan, bed_depth_m)
 
-    # Calculate ice thickness
-    ice_thickness_m = bed_depth_m - surface_depth_m
+    # Ice thickness calculation using two-way travel time like TERRA
+    # Method 1: Direct thickness from travel time difference (TERRA's approach)
+    travel_time_diff_us = bed_travel_time_us - surface_travel_time_us  # Two-way travel time through ice
+    ice_thickness_direct_m = (travel_time_diff_us * 1e-6) / 2 * wave_velocity_ice  # Convert to one-way then to depth
+    
+    # Method 2: Bed depth minus surface depth (should be equivalent)
+    ice_thickness_alternate_m = bed_depth_m - surface_depth_m
+    
+    # Use direct method as primary (matches TERRA's approach exactly)
+    ice_thickness_m = ice_thickness_direct_m
 
     # Create output file path
     output_path = Path(output_filepath)
@@ -132,11 +151,39 @@ def export_ice_measurements(
                     [f"# Wave velocity in ice: {wave_velocity_ice:.0f} m/s"]
                 )
                 writer.writerow([f"# Ice dielectric constant: {dielectric_constant}"])
-                writer.writerow(
-                    [
-                        f"# Pixels per microsecond: {processor.pixels_per_microsecond:.3f}"
-                    ]
-                )
+                if hasattr(processor, 'calpip_pixel_distance') and processor.calpip_pixel_distance and processor.calpip_pixel_distance > 0:
+                    writer.writerow(
+                        [
+                            f"# Calpip calibration: 2.0 μs between calpip lines, {processor.calpip_pixel_distance:.1f} pixels spacing"
+                        ]
+                    )
+                    writer.writerow(
+                        [
+                            f"# Microseconds per pixel: {2.0/processor.calpip_pixel_distance:.4f} (calpip-based)"
+                        ]
+                    )
+                else:
+                    writer.writerow(
+                        [
+                            f"                if hasattr(processor, 'calpip_pixel_distance') and processor.calpip_pixel_distance and processor.calpip_pixel_distance > 0:
+                    writer.writerow(
+                        [
+                            f"# Calpip calibration: 2.0 μs between calpip lines, {processor.calpip_pixel_distance:.1f} pixels spacing"
+                        ]
+                    )
+                    writer.writerow(
+                        [
+                            f"# Microseconds per pixel: {2.0/processor.calpip_pixel_distance:.4f} (calpip-based)"
+                        ]
+                    )
+                else:
+                    writer.writerow(
+                        [
+                            f"# Pixels per microsecond: {processor.pixels_per_microsecond:.3f} (fallback method)"
+                        ]
+                    )"
+                        ]
+                    )
                 writer.writerow(
                     [
                         f"# Transmitter pulse Y position: {processor.transmitter_pulse_y_abs:.1f} pixels"
@@ -147,6 +194,8 @@ def export_ice_measurements(
                 )
                 writer.writerow([f"# X description: {x_description}"])
                 writer.writerow(["# Data quality notes:"])
+                writer.writerow(["#   - Travel times are TWO-WAY (like TERRA methodology)"])
+                writer.writerow(["#   - Calibration uses calpip spacing (2 μs between lines)"])
                 writer.writerow(["#   - NaN values indicate no valid echo detected"])
                 writer.writerow(
                     ["#   - Negative travel times set to NaN (invalid echoes)"]
@@ -157,15 +206,15 @@ def export_ice_measurements(
                         "#   - Bed depth: depth from air-ice interface to ice-bedrock interface"
                     ]
                 )
-                writer.writerow(["#   - Ice thickness: bed depth minus surface depth"])
+                writer.writerow(["#   - Ice thickness: (bed_twt - surface_twt) / 2 * ice_velocity"])
                 writer.writerow(["#"])
 
             # Write column headers
             headers = [
                 f"x_position_{x_unit}",
-                "surface_travel_time_us",
+                "surface_twt_us",  # Two-way travel time like TERRA
                 "surface_depth_m",
-                "bed_travel_time_us",
+                "bed_twt_us",      # Two-way travel time like TERRA
                 "bed_depth_m",
                 "ice_thickness_m",
             ]

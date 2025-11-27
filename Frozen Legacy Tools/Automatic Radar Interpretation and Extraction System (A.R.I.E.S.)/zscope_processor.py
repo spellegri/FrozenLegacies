@@ -54,6 +54,8 @@ class ZScopeProcessor:
         self.transmitter_pulse_y_abs = None
         self.best_pip_details = None
         self.pixels_per_microsecond = None
+        self.calpip_pixel_distance = None  # For TERRA-style calpip calibration
+        self.calpip_y_lines = []  # Store actual y-line positions from TERRA method
         self.calibrated_fig = None
         self.calibrated_ax = None
         self.detected_surface_y_abs = None
@@ -63,6 +65,36 @@ class ZScopeProcessor:
         self.last_pip_details = None
         self.calculated_ticks = None  # For storing CBD tick positions
         self._parameters_were_optimized = False  # Track if parameters were updated
+
+    def ask_calpip_method(self):
+        """Ask user to choose between ARIES and TERRA calpip detection methods"""
+        import tkinter as tk
+        from tkinter import messagebox
+        
+        # Create a simple dialog window
+        root = tk.Tk()
+        root.withdraw()  # Hide the main window
+        
+        # Ask user for method choice
+        choice = messagebox.askyesno(
+            "Use TERRA Calpip Method?",
+            "Do you want to use TERRA's manual calpip picking?\n\n"
+            "YES = Use TERRA Method (Manual selection)\n"
+            "   • Manually click on 4 calpip lines\n"
+            "   • User controls exactly which lines\n"
+            "   • No yellow dashed lines shown\n"
+            "   • Same method as TERRA system\n\n"
+            "NO = Use ARIES Method (Automatic detection)\n"
+            "   • Automatically finds calpip lines\n"
+            "   • Uses image processing algorithms\n"
+            "   • Shows yellow dashed 'Picked Calpip' lines\n"
+            "   • Fast and consistent\n\n"
+            "Click YES to use TERRA method or NO to use ARIES method"
+        )
+        
+        root.destroy()
+        
+        return "TERRA" if choice else "ARIES"
 
     def save_calpip_state(self, state_path):
         import numpy as np
@@ -82,7 +114,16 @@ class ZScopeProcessor:
                 return obj
 
         if self.best_pip_details is not None:
-            serializable_pip = make_json_serializable(self.best_pip_details)
+            # Ensure the saved pip details include absolute calpip y-line positions
+            pip_copy = dict(self.best_pip_details)
+            try:
+                if hasattr(self, 'calpip_y_lines') and self.calpip_y_lines:
+                    # Save the full-image absolute tick positions so subsequent images can reuse exact pixels
+                    pip_copy['tick_positions'] = list(self.calpip_y_lines)
+            except Exception:
+                pass
+
+            serializable_pip = make_json_serializable(pip_copy)
             with open(state_path, "w") as f:
                 json.dump(serializable_pip, f, indent=4)
             print(f"INFO: Calpip state saved to {state_path}")
@@ -95,9 +136,41 @@ class ZScopeProcessor:
             with open(state_file, "r") as f:
                 self.best_pip_details = json.load(f)
             self.last_pip_details = self.best_pip_details
+            # Set calpip pixel distance for TERRA-style calibration
+            if self.best_pip_details and "mean_spacing" in self.best_pip_details:
+                self.calpip_pixel_distance = self.best_pip_details["mean_spacing"]
             print(f"INFO: Calpip state loaded from {state_path}")
         else:
             print(f"WARNING: Calpip state file {state_path} does not exist.")
+
+        # Restore absolute calpip y-line positions if present in the saved state
+        try:
+            if self.best_pip_details and 'tick_positions' in self.best_pip_details:
+                # Tick positions may have been saved relative to a cropped region. If data_top_abs
+                # exists and the saved positions look small, attempt to adjust to full-image coords.
+                saved_ticks = list(self.best_pip_details.get('tick_positions', []))
+                if saved_ticks:
+                    # If positions look like cropped coordinates (max less than image height), try to
+                    # interpret them as full-image positions; otherwise, if data_top_abs exists we
+                    # assume saved ticks were relative to crop and add data_top_abs.
+                    if hasattr(self, 'data_top_abs') and self.data_top_abs is not None:
+                        # Heuristic: if max(saved_ticks) < (self.data_bottom_abs - self.data_top_abs),
+                        # they were likely saved relative to the crop and need offsetting.
+                        try:
+                            crop_height = self.data_bottom_abs - self.data_top_abs
+                            if max(saved_ticks) <= crop_height + 5:
+                                adjusted = [float(y + self.data_top_abs) for y in saved_ticks]
+                                self.calpip_y_lines = adjusted
+                            else:
+                                # Already absolute positions
+                                self.calpip_y_lines = [float(y) for y in saved_ticks]
+                        except Exception:
+                            self.calpip_y_lines = [float(y) for y in saved_ticks]
+                    else:
+                        self.calpip_y_lines = [float(y) for y in saved_ticks]
+                    print(f"INFO: Restored {len(self.calpip_y_lines)} saved calpip tick positions from state file")
+        except Exception:
+            pass
 
     def export_enhanced_csv_with_coordinates(
         self, output_dir, nav_df=None, cbd_tick_xs=None
@@ -196,7 +269,7 @@ class ZScopeProcessor:
 
     def _convert_pixels_to_one_way_time(self, y_pixels):
         """
-        Convert pixel positions to one-way travel time in microseconds.
+        Convert pixel positions to one-way travel time in microseconds using TERRA methodology.
         """
         if self.transmitter_pulse_y_abs is None or self.pixels_per_microsecond is None:
             return np.full_like(y_pixels, np.nan)
@@ -204,37 +277,47 @@ class ZScopeProcessor:
         # Convert to relative pixel position from transmitter pulse
         y_relative = y_pixels - self.transmitter_pulse_y_abs
 
-        # Convert to two-way travel time
-        two_way_time_us = y_relative / self.pixels_per_microsecond
-
-        # Convert to one-way travel time
-        one_way_time_us = two_way_time_us / 2.0
+        # TERRA methodology: time represents travel time for depth calculation
+        time_us = y_relative / self.pixels_per_microsecond
+        
+        # For CSV export compatibility, provide one-way equivalent 
+        # (TERRA uses direct multiplication, so divide by 2 for one-way labeling)
+        one_way_time_us = time_us / 2.0
 
         return one_way_time_us
 
+
     def _calculate_ice_thickness_meters(self, surface_y_pixels, bed_y_pixels):
         """
-        Calculate ice thickness in meters using proper one-way travel times.
+        Calculate ice thickness using USER'S EXACT FORMULA: H_ICE = ((BED TWT - SURFACE TWT)/2)*V_ICE
         """
-        if self.transmitter_pulse_y_abs is None or self.pixels_per_microsecond is None:
+        if self.transmitter_pulse_y_abs is None:
             return np.full_like(surface_y_pixels, np.nan)
 
-        # Get one-way travel times
-        surface_time_us = self._convert_pixels_to_one_way_time(surface_y_pixels)
-        bed_time_us = self._convert_pixels_to_one_way_time(bed_y_pixels)
-
-        # Calculate travel time difference (one-way through ice)
-        ice_travel_time_us = bed_time_us - surface_time_us
-
-        # Convert to meters using physical constants
-        c0 = self.physics_constants.get("speed_of_light_vacuum_mps", 299792458)
-        epsilon_r = self.physics_constants.get("ice_relative_permittivity_real", 3.17)
-        firn_correction = self.physics_constants.get("firn_correction_meters", 0.0)
-
-        # Calculate ice velocity and thickness
-        ice_velocity = c0 / np.sqrt(epsilon_r)  # m/s
-        time_in_seconds = ice_travel_time_us * 1e-6  # Convert μs to seconds
-        ice_thickness = (time_in_seconds * ice_velocity) + firn_correction
+        # USER'S EXACT FORMULAS:
+        # SURFACE TWT = (Y-PIXEL LOCATION OF SURFACE/CALPIP AVG DISTANCE)*2
+        # BED TWT = (Y-PIXEL LOCATION OF BED/CALPIP AVG DISTANCE)*2  
+        # H_ICE = ((BED TWT - SURFACE TWT)/2)*V_ICE
+        
+        velocity_ice = 168.0  # m/μs
+        
+        # Convert pixel positions to relative positions from transmitter pulse
+        surface_y_rel = surface_y_pixels - self.transmitter_pulse_y_abs
+        bed_y_rel = bed_y_pixels - self.transmitter_pulse_y_abs
+        
+        if hasattr(self, 'calpip_pixel_distance') and self.calpip_pixel_distance:
+            # SURFACE TWT = (Y-PIXEL LOCATION OF SURFACE/CALPIP AVG DISTANCE)*2
+            surface_twt = (surface_y_rel / self.calpip_pixel_distance) * 2.0
+            # BED TWT = (Y-PIXEL LOCATION OF BED/CALPIP AVG DISTANCE)*2
+            bed_twt = (bed_y_rel / self.calpip_pixel_distance) * 2.0
+            # H_ICE = ((BED TWT - SURFACE TWT)/2)*V_ICE
+            ice_thickness = ((bed_twt - surface_twt) / 2.0) * velocity_ice
+        else:
+            # Fallback using pixels_per_microsecond
+            surface_twt = surface_y_rel / self.pixels_per_microsecond
+            bed_twt = bed_y_rel / self.pixels_per_microsecond
+            # H_ICE = ((BED TWT - SURFACE TWT)/2)*V_ICE
+            ice_thickness = ((bed_twt - surface_twt) / 2.0) * velocity_ice
 
         return ice_thickness
 
@@ -394,6 +477,17 @@ class ZScopeProcessor:
         enhanced = cv2.createCLAHE(clipLimit=3.0).apply(valid_data_crop)
         ax.imshow(enhanced, cmap="gray", aspect="auto")
 
+        # Add transmitter pulse reference line
+        tx_pulse_y_rel = self.transmitter_pulse_y_abs - self.data_top_abs
+        ax.axhline(
+            y=tx_pulse_y_rel,
+            color="#0072B2",
+            linestyle="-",
+            linewidth=2,
+            alpha=0.8,
+            label="Transmitter Pulse (0 µs)",
+        )
+
         # Plot automatic traces
         x_coords = np.arange(len(self.detected_surface_y_abs))
 
@@ -473,9 +567,103 @@ class ZScopeProcessor:
             if user_input in ["y", "yes"]:
                 return True
             elif user_input in ["n", "no"]:
-                return False
+                return self._get_optimization_choice()
             else:
                 print("Please enter 'y' for yes or 'n' for no")
+
+    def _get_optimization_choice(self):
+        """
+        Get user choice for parameter optimization method.
+        
+        Returns:
+            bool: False to trigger optimization, True if user wants to proceed after config edit
+        """
+        import subprocess
+        import os
+        import platform
+        
+        while True:
+            print("\nParameter optimization options:")
+            print("1. Interactive point selection (click on surface/bed examples)")
+            print("2. Edit configuration file directly")
+            
+            choice = input("Enter choice (1 or 2): ").strip()
+            
+            if choice == "1":
+                # Use existing interactive point selection
+                return False
+            elif choice == "2":
+                # Open config file for direct editing
+                return self._edit_config_file_directly()
+            else:
+                print("Please enter '1' or '2'")
+
+    def _edit_config_file_directly(self):
+        """
+        Open the config file in the system's default editor for direct editing.
+        
+        Returns:
+            bool: True if user wants to proceed after editing, False to continue optimization
+        """
+        import subprocess
+        import os
+        import platform
+        import json
+        
+        # Get the config file path
+        config_file = Path(__file__).parent / "config" / "default_config.json"
+        
+        print(f"\nOpening configuration file: {config_file}")
+        print("The file will open in your default editor.")
+        print("Make your changes, save the file, and close the editor.")
+        
+        try:
+            # Open file with system default application
+            if platform.system() == "Windows":
+                os.startfile(config_file)
+            elif platform.system() == "Darwin":  # macOS
+                subprocess.run(["open", config_file])
+            else:  # Linux
+                subprocess.run(["xdg-open", config_file])
+            
+            # Wait for user to finish editing
+            input("\nPress Enter after you have finished editing and saved the configuration file...")
+            
+            # Reload the configuration
+            try:
+                with open(config_file, 'r') as f:
+                    new_config = json.load(f)
+                
+                # Update the processor's config
+                self.config = new_config
+                print("Configuration reloaded successfully!")
+                
+                # Ask if user wants to test the changes or proceed
+                while True:
+                    choice = input(
+                        "\nConfiguration updated. Choose next action:\n"
+                        "1. Re-run detection with new settings (recommended)\n"
+                        "2. Proceed to CBD selection with current results\n"
+                        "Enter choice (1 or 2): "
+                    ).strip()
+                    
+                    if choice == "1":
+                        self._config_just_updated = True  # Set flag for config update
+                        return False  # Trigger re-run of detection
+                    elif choice == "2":
+                        return True   # Proceed with current results
+                    else:
+                        print("Please enter '1' or '2'")
+                        
+            except json.JSONDecodeError as e:
+                print(f"ERROR: Invalid JSON in configuration file: {e}")
+                print("Please fix the JSON syntax and try again.")
+                return self._edit_config_file_directly()  # Try again
+                
+        except Exception as e:
+            print(f"ERROR: Could not open configuration file: {e}")
+            print("Falling back to interactive point selection...")
+            return False
 
     def _run_user_guided_calibration(self, valid_data_crop):
         """
@@ -608,7 +796,7 @@ class ZScopeProcessor:
             self.detected_bed_y_abs = np.full(width_for_nan_fallback, np.nan)
 
     def process_image(
-        self, image_path_str, output_dir_str, approx_x_pip, nav_df=None, nav_path=None
+        self, image_path_str, output_dir_str, approx_x_pip, nav_df=None, nav_path=None, reuse_calibration=False
     ):
         """
         Main image processing method with adaptive parameter learning and automatic-first workflow.
@@ -616,6 +804,9 @@ class ZScopeProcessor:
         image_path_obj = Path(image_path_str)
         self.base_filename = image_path_obj.stem
         self.output_dir = Path(output_dir_str)
+        
+        # Store for batch processing reuse
+        self.last_approx_x_pip = approx_x_pip
 
         # NEW: Load optimized parameters from previous processing
         if self.load_previous_optimized_parameters(self.output_dir):
@@ -633,6 +824,7 @@ class ZScopeProcessor:
         current_output_params = {
             "debug_output_directory": str(self.output_dir / debug_subdir_name),
             "figure_save_dpi": output_params_config.get("figure_save_dpi", 300),
+            "save_intermediate_plots": output_params_config.get("save_intermediate_plots", True),
         }
 
         Path(current_output_params["debug_output_directory"]).mkdir(
@@ -730,16 +922,109 @@ class ZScopeProcessor:
             f"INFO: Z-scope boundary for pip strip detected at Y-pixel (absolute): {z_boundary_y_for_pip}"
         )
 
+        # Get pip detection config (needed for both methods)
         pip_detection_main_config = self.config.get("pip_detection_params", {})
-        self.best_pip_details = detect_calibration_pip(
-            self.image_np,
-            self.base_filename,
-            approx_x_pip,
-            self.data_top_abs,
-            self.data_bottom_abs,
-            z_boundary_y_for_pip,
-            pip_detection_params=pip_detection_main_config,
-        )
+        
+        # Check if we should reuse calibration from previous image
+        if reuse_calibration and hasattr(self, 'best_pip_details') and self.best_pip_details is not None:
+            print("INFO: Reusing calibration data from previous image...")
+            print(f"INFO: Previous calibration: {self.best_pip_details.get('tick_count', 0)} ticks, "
+                  f"spacing: {self.best_pip_details.get('mean_spacing', 0):.2f}px, "
+                  f"method: {self.best_pip_details.get('method', 'Unknown')}")
+            # Skip calpip detection and use existing calibration
+            # Ensure calpip_y_lines is set correctly for current method choice
+            method_choice = getattr(self, 'calpip_method_choice', None)
+            if method_choice is None:
+                method_choice = self.ask_calpip_method()
+            # Store method choice for later use
+            self.calpip_method_choice = method_choice
+            if method_choice == "TERRA":
+                self.calpip_y_lines = []  # TERRA method: no yellow lines
+                print("INFO: Reusing calibration - TERRA method, no yellow lines")
+            else:
+                # ARIES method: show yellow lines if calibration data available
+                if self.best_pip_details and 'mean_spacing' in self.best_pip_details:
+                    spacing = self.best_pip_details['mean_spacing']
+                    start_y = self.data_top_abs + spacing if hasattr(self, 'data_top_abs') else spacing
+                    self.calpip_y_lines = [start_y + (i * spacing) for i in range(4)]
+                    print(f"INFO: Reusing calibration - ARIES method, showing {len(self.calpip_y_lines)} yellow lines")
+                else:
+                    self.calpip_y_lines = []
+        else:
+            # Perform new calpip detection
+            # Use stored method choice or ask if not set
+            method_choice = getattr(self, 'calpip_method_choice', None)
+            if method_choice is None:
+                method_choice = self.ask_calpip_method()
+            # Store method choice for later use
+            self.calpip_method_choice = method_choice
+            
+            if method_choice == "TERRA":
+                print("\nUsing TERRA manual calpip selection method...")
+                print("INFO: Opening TERRA-style calpip picker")
+                print("INFO: No yellow dashed lines will be shown (TERRA method)")
+                from functions.terra_calpip_picker import terra_calpip_method
+                
+                # Use the same cropped region that ARIES displays for processing
+                if hasattr(self, 'data_top_abs') and hasattr(self, 'data_bottom_abs') and \
+                   self.data_top_abs is not None and self.data_bottom_abs is not None:
+                    # Pass the cropped image to match ARIES coordinate system
+                    cropped_image = self.image_np[self.data_top_abs:self.data_bottom_abs, :]
+                    print(f"INFO: Using ARIES cropped region: {self.data_top_abs} to {self.data_bottom_abs}")
+                    result = terra_calpip_method(cropped_image, self.base_filename)
+                    
+                    if result and len(result) == 3:
+                        self.best_pip_details, calpip_y_lines_cropped, self.calpip_pixel_distance = result
+                        # Adjust full grid line positions to full image coordinates for display
+                        # Use the complete grid generated from manual picks, not just the picked points
+                        full_grid_coords = []
+                        for y_line in calpip_y_lines_cropped:
+                            adjusted_y = y_line + self.data_top_abs
+                            full_grid_coords.append(adjusted_y)
+                        # TERRA method: Show grey lines throughout radargram based on manual pick spacing
+                        self.calpip_y_lines = full_grid_coords
+                        manual_count = len(self.best_pip_details.get('manual_picks', []))
+                        print(f"INFO: TERRA method - generated {len(self.calpip_y_lines)} grey grid lines from {manual_count} manual picks")
+                    else:
+                        self.best_pip_details = result
+                        self.calpip_y_lines = []
+                else:
+                    # Fallback to full image if crop boundaries not available
+                    result = terra_calpip_method(self.image_np, self.base_filename)
+                    if result and len(result) == 3:
+                        self.best_pip_details, calpip_y_lines_full, self.calpip_pixel_distance = result
+                        # For full image processing, use the complete generated grid
+                        # This contains all grid lines throughout the radargram based on manual pick spacing
+                        self.calpip_y_lines = calpip_y_lines_full
+                        manual_count = len(self.best_pip_details.get('manual_picks', []))
+                        print(f"INFO: TERRA method - showing {len(self.calpip_y_lines)} grey grid lines from {manual_count} manual picks")
+                    else:
+                        self.best_pip_details = result
+                        self.calpip_y_lines = []
+            else:
+                print("\nUsing ARIES automatic calpip detection method...")
+                print("INFO: Yellow dashed lines will be shown (ARIES method)")
+                # Add output_params to pip detection config
+                pip_detection_main_config["output_params"] = current_output_params
+                
+                self.best_pip_details = detect_calibration_pip(
+                    self.image_np,
+                    self.base_filename,
+                    approx_x_pip,
+                    self.data_top_abs,
+                    self.data_bottom_abs,
+                    z_boundary_y_for_pip,
+                    pip_detection_params=pip_detection_main_config,
+                )
+                # ARIES method: Generate yellow dashed lines based on detected calpip
+                if self.best_pip_details and 'mean_spacing' in self.best_pip_details:
+                    # Generate 4 calpip lines at 2μs intervals
+                    spacing = self.best_pip_details['mean_spacing']
+                    start_y = self.data_top_abs + spacing  # First line at ~2μs
+                    self.calpip_y_lines = [start_y + (i * spacing) for i in range(4)]
+                    print(f"INFO: Generated {len(self.calpip_y_lines)} yellow calpip lines for ARIES method")
+                else:
+                    self.calpip_y_lines = []
 
         calpip_state_path = self.output_dir / "calpip_state.json"
         if not self.best_pip_details:
@@ -777,9 +1062,13 @@ class ZScopeProcessor:
         )
 
         try:
+            # Use ARIES's original calibration method 
             self.pixels_per_microsecond = calculate_pixels_per_microsecond(
                 self.best_pip_details["mean_spacing"], pip_interval_us
             )
+            # Store calpip pixel distance for TERRA-style calibration
+            self.calpip_pixel_distance = self.best_pip_details["mean_spacing"]
+            
         except ValueError as e:
             print(f"ERROR calculating pixels_per_microsecond: {e}")
             return False
@@ -787,6 +1076,16 @@ class ZScopeProcessor:
         print(
             f"INFO: Calculated pixels per microsecond: {self.pixels_per_microsecond:.3f}"
         )
+        print(
+            f"INFO: Calpip pixel distance: {self.calpip_pixel_distance:.1f} pixels per {pip_interval_us} μs"
+        )
+        
+        # Show what ARIES detected and how it calibrates
+        if self.best_pip_details:
+            print(f"DEBUG: ARIES detected {self.best_pip_details['tick_count']} tick marks")
+            print(f"DEBUG: Mean spacing: {self.best_pip_details['mean_spacing']:.2f} pixels")
+            print(f"DEBUG: Assuming each spacing represents {pip_interval_us} μs")
+            print(f"DEBUG: Calibration: {self.best_pip_details['mean_spacing']:.2f} px ÷ {pip_interval_us} μs = {self.pixels_per_microsecond:.3f} px/μs")
 
         print("\nStep 6.5: Automatic Echo Detection with Optional User Guidance...")
 
@@ -836,7 +1135,52 @@ class ZScopeProcessor:
         # Phase 2: Show results and get user feedback
         user_satisfied = self._show_automatic_results_for_approval(valid_data_crop)
 
-        if not user_satisfied:
+        # Handle user satisfaction and optimization requests
+        while not user_satisfied:
+            # Check if config was just updated and user wants to re-run
+            if hasattr(self, '_config_just_updated') and self._config_just_updated:
+                print("Re-running automatic detection with updated configuration...")
+                self._config_just_updated = False  # Reset flag
+                
+                # Re-run transmitter pulse detection first (in case those params changed)
+                print("Re-detecting transmitter pulse with updated parameters...")
+                tx_pulse_params_config = self.config.get("transmitter_pulse_params", {})
+                self.transmitter_pulse_y_abs = detect_transmitter_pulse(
+                    self.image_np,
+                    self.base_filename,
+                    self.data_top_abs,
+                    self.data_bottom_abs,
+                    tx_pulse_params=tx_pulse_params_config,
+                )
+                tx_pulse_y_rel = self.transmitter_pulse_y_abs - self.data_top_abs
+                
+                # Re-run automatic detection with updated config
+                echo_tracing_config = self.config.get("echo_tracing_params", {})
+                surface_config = echo_tracing_config.get("surface_detection", {})
+                bed_config = echo_tracing_config.get("bed_detection", {})
+                
+                surface_y_rel = detect_surface_echo(
+                    valid_data_crop, tx_pulse_y_rel, surface_config
+                )
+                
+                if np.any(np.isfinite(surface_y_rel)):
+                    self.detected_surface_y_abs = surface_y_rel + self.data_top_abs
+                    bed_y_rel = detect_bed_echo(
+                        valid_data_crop, surface_y_rel, z_boundary_y_rel, bed_config
+                    )
+                    if np.any(np.isfinite(bed_y_rel)):
+                        self.detected_bed_y_abs = bed_y_rel + self.data_top_abs
+                    
+                print("Echo detection completed with updated configuration!")
+                
+                # Show updated results and get approval again
+                print("Displaying updated automatic detection results...")
+                user_satisfied = self._show_automatic_results_for_approval(valid_data_crop)
+                
+                # Continue loop to check satisfaction again
+                continue
+                    
+            # If not satisfied and no config update, run guided calibration
             print(
                 "User requested parameter optimization - starting guided calibration..."
             )
@@ -866,14 +1210,18 @@ class ZScopeProcessor:
                     self.detected_surface_y_abs = surface_y_rel + self.data_top_abs
                 if np.any(np.isfinite(bed_y_rel)):
                     self.detected_bed_y_abs = bed_y_rel + self.data_top_abs
-
+                
+                # Mark as satisfied after guided calibration
+                user_satisfied = True
                 print("Echo detection completed with user-optimized parameters")
             else:
-                print("User-guided calibration cancelled - using automatic results")
-        else:
-            print("User satisfied with automatic results - proceeding to CBD selection")
+                # If no optimization parameters, break out of loop
+                print("No optimization parameters obtained. Proceeding with current results.")
+                user_satisfied = True
 
-        print("Echo detection phase completed successfully!")
+        # Final status message
+        if user_satisfied:
+            print("Echo detection phase completed successfully!")
 
         print("\nStep 7: Creating time-calibrated Z-scope visualization...")
         time_vis_params_config = self.config.get(
@@ -898,6 +1246,8 @@ class ZScopeProcessor:
                 nav_path=nav_path,
                 main_output_dir=self.output_dir,
                 processor_ref=self,
+                calpip_y_lines=self.calpip_y_lines,
+                calpip_method=getattr(self, 'calpip_method_choice', 'ARIES'),
             )
         )
 

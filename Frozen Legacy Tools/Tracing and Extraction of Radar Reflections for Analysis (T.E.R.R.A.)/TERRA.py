@@ -145,7 +145,7 @@ class Window:
         # Store the CSV directory for LAT/LON data
         self.csv_directory = csv_directory
         
-        # Fixed display size setup
+        # Fixed display size setup (preserving original TERRA behavior)
         self.fixedSize = fixedSize
         orig_h, orig_w = self.sourceImage.shape[:2]
         self.scale_x = orig_w / fixedSize[0]
@@ -167,7 +167,7 @@ class Window:
         self.calpip_pixel_distance = None
         self.calpip_y_lines = []
 
-        # Create window at fixed size with title "TERRA"
+        # Create window at fixed size with title "TERRA" (preserving original behavior)
         cv2.namedWindow(self.windowName, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(self.windowName, fixedSize[0], fixedSize[1])
  
@@ -844,7 +844,7 @@ class Window:
             flt_number = float('nan')
 
         # Constants
-        velocity_ice = 169.0  # m/us
+        velocity_ice = 168.0  # m/us - aligned with ARIES
 
         # Now all arrays should have the same length, so we can use a simple loop
         for i in range(len(points_surface)):
@@ -922,7 +922,7 @@ class Window:
                 if not np.isnan(y_surface_corrected[-1]):
                     surf_twt_val = y_surface_corrected[-1] * us_per_pixel
                     surf_twt.append(surf_twt_val)
-                    surf_m.append(surf_twt_val / 2 * velocity_ice)
+                    surf_m.append((surf_twt_val / 2) * velocity_ice)  # SURFACE DEPTH = (SURFACE TWT/2)*V_ICE
                 else:
                     surf_twt.append(float('nan'))
                     surf_m.append(float('nan'))
@@ -930,7 +930,7 @@ class Window:
                 if not np.isnan(y_bed_corrected[-1]):
                     bed_twt_val = y_bed_corrected[-1] * us_per_pixel
                     bed_twt.append(bed_twt_val)
-                    bed_m.append(bed_twt_val / 2 * velocity_ice)
+                    bed_m.append((bed_twt_val / 2) * velocity_ice)  # BED DEPTH = (BED TWT/2)*V_ICE
                 else:
                     bed_twt.append(float('nan'))
                     bed_m.append(float('nan'))
@@ -938,7 +938,7 @@ class Window:
                 if not np.isnan(delta_y[-1]):
                     h_ice_twt_val = delta_y[-1] * us_per_pixel
                     h_ice_twt.append(h_ice_twt_val)
-                    h_ice_m.append(h_ice_twt_val / 2 * velocity_ice)
+                    h_ice_m.append((h_ice_twt_val / 2) * velocity_ice)  # H_ICE = ((BED TWT - SURFACE TWT)/2)*V_ICE
                 else:
                     h_ice_twt.append(float('nan'))
                     h_ice_m.append(float('nan'))
@@ -1035,7 +1035,7 @@ class Window:
                 
                 # Only show labels for lines below transmitted pulse (positive time)
                 if time_us > 0 and time_us <= 50:  # Reasonable range
-                    depth_m = time_us * velocity_ice  # Don't divide by 2 as requested
+                    depth_m = (time_us / 2) * velocity_ice  # DEPTH = (TWO WAY TRAVEL TIME/2)*V_ICE
                     positions.append(disp_y)
                     time_labels.append(f"{time_us:.0f}")
                     depth_labels.append(f"{depth_m:.0f}")

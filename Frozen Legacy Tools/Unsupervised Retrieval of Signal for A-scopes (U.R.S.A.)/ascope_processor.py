@@ -1,6 +1,7 @@
 import os
 import sys
 import numpy as np
+import io
 import cv2
 import matplotlib.pyplot as plt
 import json
@@ -8,6 +9,21 @@ import pandas as pd
 import datetime
 import re
 from pathlib import Path
+
+# Optional GUI: prefer PyQt5 for modal image dialogs; fall back to console/os viewer
+HAVE_QT = False
+try:
+    from PyQt5 import QtWidgets, QtGui, QtCore
+    HAVE_QT = True
+except Exception as e:
+    print(f"DEBUG: PyQt5 import failed: {e}")
+    HAVE_QT = False
+
+try:
+    from PIL import Image
+    HAVE_PIL = True
+except Exception:
+    HAVE_PIL = False
 
 # Add the functions directory to the Python path
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -142,6 +158,9 @@ class AScope:
             )
             raise
 
+        # Store resolved config path for interactive editing
+        self.config_path_resolved = resolved_config_path
+
         # Initialize configuration sections
         self.processing_params = self.config.get("processing_params", {})
         self.physical_params = self.config.get("physical_params", {})
@@ -155,13 +174,32 @@ class AScope:
         self.cbd_list = []
         self.nav_dict = {}  # CBD -> (LAT, LON) mapping
 
+        # Interactive/deferred plotting state
+        self.interactive_mode = False
+        self.defer_frame_plots = False
+        self._deferred_frame_images = []
+        # deferred calibrated-only images (no surface/bed picks)
+        self._deferred_calib_images = []
+
         if self.debug_mode:
             print(f"Debug mode enabled. Using config from: {resolved_config_path}")
 
+        # Qt application instance (created lazily)
+        self._qt_app = None
+
     def set_output_directory(self, output_dir):
         """Override the output directory."""
-        self.output_config["output_dir"] = output_dir
+        if "output" not in self.config:
+            self.config["output"] = {}
+        self.config["output"]["output_dir"] = output_dir
         self.output_dir = ensure_output_dirs(self.config)
+
+    def set_interactive_mode(self, enabled=True, defer_frame_plots=True):
+        """Enable interactive confirmation flow. When enabled, per-frame plots will
+        be deferred in memory until final approval.
+        """
+        self.interactive_mode = bool(enabled)
+        self.defer_frame_plots = bool(defer_frame_plots)
 
     def set_debug_mode(self, debug_mode):
         """Set debug mode for additional outputs."""
@@ -193,11 +231,11 @@ class AScope:
 
     def _calculate_ice_thickness(self, surface_time_us, bed_time_us):
         """
-        Calculate ice thickness using one-way travel times.
+        Calculate ice thickness using two-way travel times.
 
         Args:
-            surface_time_us (float): Surface echo time in microseconds (one-way)
-            bed_time_us (float): Bed echo time in microseconds (one-way)
+            surface_time_us (float): Surface echo time in microseconds (two-way)
+            bed_time_us (float): Bed echo time in microseconds (two-way)
 
         Returns:
             float: Ice thickness in meters, or NaN if calculation not possible
@@ -214,10 +252,11 @@ class AScope:
             )
             return np.nan
 
-        # Ice thickness = (bed_time - surface_time) × ice_velocity
+        # Ice thickness = [(bed_time - surface_time) / 2] × ice_velocity
+        # Dividing by 2 because radar measures two-way travel time (down and back up)
         # Using standard ice velocity of 168 m/μs
         ice_velocity_m_per_us = 168.0
-        travel_time_us = bed_time_us - surface_time_us
+        travel_time_us = (bed_time_us - surface_time_us) / 2.0
         ice_thickness_m = travel_time_us * ice_velocity_m_per_us
 
         return ice_thickness_m
@@ -280,6 +319,9 @@ class AScope:
         self.base_filename = base_filename
         self.frame_results = []  # Reset frame results for new image
 
+        # Clear deferred images state
+        self._deferred_frame_images = []
+
         # Extract CBD sequence from filename
         self.cbd_list = self._extract_cbd_sequence_from_filename(base_filename)
 
@@ -288,17 +330,22 @@ class AScope:
         # Step 1: Mask sprocket holes
         print("Step 1: Masking sprocket holes...")
         masked_image, mask = mask_sprocket_holes(image, self.config)
+        # Keep masked image for possible re-runs / repicks
+        self._last_masked_image = masked_image
 
         # Step 2: Detect A-scope frames
         print("Step 2: Detecting A-scope frames...")
         expected_frames = len(self.cbd_list) if self.cbd_list else None
         frames = detect_ascope_frames(masked_image, self.config, expected_frames)
+        # persist detected frames for potential re-runs
+        self.frames = frames
 
         # Validate frame count against CBD sequence
         if self.cbd_list and len(frames) != len(self.cbd_list):
             print(
                 f"WARNING: Frame count ({len(frames)}) doesn't match expected CBD count ({len(self.cbd_list)})"
             )
+            
             if len(frames) < len(self.cbd_list):
                 # Adjust CBD list to match detected frames
                 print(
@@ -317,24 +364,536 @@ class AScope:
 
         # Step 3: Verify frames visually
         print("Step 3: Creating frame verification plot...")
+        # verify_frames_visually saves a verification PNG into output dir
         verify_frames_visually(masked_image, frames, base_filename, self.config)
 
-        # Step 4: Process each frame
-        print(f"Step 4: Processing {len(frames)} individual frames...")
+        # Interactive confirmation after frame detection
+        if self.interactive_mode:
+            try:
+                # Loop to allow config editing and re-detection
+                while True:
+                    verif_file = Path(self.output_dir) / f"{base_filename}_frame_verification.png"
+                    if verif_file.exists():
+                        print(f"\nFrame verification plot: {verif_file}")
+                        
+                        # Use simple PyQt5 Yes/No dialog
+                        try:
+                            from PyQt5.QtWidgets import QApplication, QLabel, QVBoxLayout, QHBoxLayout, QPushButton, QDialog
+                            from PyQt5.QtGui import QPixmap
+                            from PyQt5.QtCore import Qt
+                            
+                            app = QApplication.instance() or QApplication([])
+                            
+                            dialog = QDialog()
+                            dialog.setWindowTitle("Frame Detection Verification")
+                            dialog.setGeometry(100, 100, 1200, 500)
+                            
+                            layout = QVBoxLayout()
+                            
+                            # Load and display image
+                            img_label = QLabel()
+                            pixmap = QPixmap(str(verif_file))
+                            img_label.setPixmap(pixmap.scaledToWidth(1100, Qt.SmoothTransformation))
+                            layout.addWidget(img_label)
+                            
+                            # Buttons
+                            button_layout = QHBoxLayout()
+                            yes_btn = QPushButton("YES - Proceed")
+                            no_btn = QPushButton("NO - Edit Config")
+                            button_layout.addWidget(yes_btn)
+                            button_layout.addWidget(no_btn)
+                            layout.addLayout(button_layout)
+                            
+                            dialog.setLayout(layout)
+                            
+                            satisfied = [None]
+                            yes_btn.clicked.connect(lambda: (satisfied.__setitem__(0, True), dialog.accept()))
+                            no_btn.clicked.connect(lambda: (satisfied.__setitem__(0, False), dialog.accept()))
+                            
+                            dialog.exec_()
+                            satisfied = satisfied[0]
+                            
+                        except Exception as e:
+                            print(f"PyQt5 dialog failed: {e}. Using console input.")
+                            resp = input("Are you satisfied with detected frames? (Y/N): ").strip().upper()
+                            satisfied = resp == "Y"
+                    else:
+                        print(f"\nNo verification image found.")
+                        resp = input("Are you satisfied with detected frames? (Y/N): ").strip().upper()
+                        satisfied = resp == "Y"
+
+                    if satisfied is False:
+                        # Edit config manually
+                        print(f"\nOpening config for editing: {self.config_path_resolved}")
+                        try:
+                            os.startfile(self.config_path_resolved)
+                        except Exception:
+                            print(f"Could not open config. Please open manually: {self.config_path_resolved}")
+                        input("Edit config, SAVE it, then press ENTER to continue...")
+                        
+                        # Reload config after edit
+                        try:
+                            with open(self.config_path_resolved, "r") as f:
+                                self.config = json.load(f)
+                        except Exception as e:
+                            print(f"Warning: could not reload config: {e}")
+                        # Update dependent sections
+                        self.processing_params = self.config.get("processing_params", {})
+                        self.physical_params = self.config.get("physical_params", {})
+                        self.output_config = self.config.get("output", {})
+                        self.output_dir = ensure_output_dirs(self.config)
+                        
+                        # RE-DETECT FRAMES with new config
+                        print(f"\n{'='*60}")
+                        print(f"Step 2B: RE-DETECTING FRAMES - With updated config")
+                        print(f"{'='*60}")
+                        frames = detect_ascope_frames(masked_image, self.config, expected_frames=len(self.cbd_list))
+                        print(f"✓ Re-detected {len(frames)} frames with updated config\n")
+                        
+                        # Regenerate verification plot
+                        verify_frames_visually(masked_image, frames, base_filename, self.config)
+                        
+                        # Loop back to show dialog again
+                        continue
+                    elif satisfied is True:
+                        print("✓ Proceeding with detected frames...")
+                        break
+            except Exception as e:
+                print(f"Interactive verification skipped due to error: {e}")
+                import traceback
+                traceback.print_exc()
+
+        # Centerize first and last A-scope frames by detecting actual signal and centering around it
+        print("DEBUG: About to centerize frames...")
+        try:
+            from utils import centerize_frames
+            print(f"DEBUG: centerize_frames imported successfully")
+            frames = centerize_frames(frames, masked_image, masked_image.shape[1])
+            print(f"DEBUG: Frames after centerize: {frames[:2]}")
+        except Exception as e:
+            print(f"ERROR: centerize_frames failed: {e}")
+            import traceback
+            traceback.print_exc()
+
+        # Step 4: Generate quick trace detection for montage review (no echo picking yet)
+        print(f"\n{'='*60}")
+        print(f"Step 4: GENERATE TRACES - Quick detection for review")
+        print(f"{'='*60}")
+        print(f"Generating trace images for {len(frames)} frames (no echo picking)...")
+        for idx, (left, right) in enumerate(frames):
+            print(f"Frame {idx + 1}/{len(frames)}: cols {left}-{right}", end=" ... ")
+            self._generate_trace_only(masked_image, left, right, base_filename, idx + 1, total_frames=len(frames))
+            print("✓")
+
+        print(f"\n✓ Generated {len(self._deferred_frame_images)} trace images.\n")
+        
+        # Step 4.5: Show trace montage for approval BEFORE full processing
+        print(f"{'='*60}")
+        print(f"Step 4.5: TRACE MONTAGE - Review detected traces")
+        print(f"{'='*60}")
+        if self.interactive_mode and self.defer_frame_plots and len(self._deferred_frame_images) > 0:
+            from utils import show_trace_montage
+            print(f"\nLaunching trace montage with {len(self._deferred_frame_images)} frames...")
+            print("Use zoom controls to inspect. Click YES to proceed to full processing, or EDIT CONFIG to adjust parameters.\n")
+            
+            # Loop to allow config editing and re-detection
+            while True:
+                trace_result = show_trace_montage(
+                    self._deferred_frame_images,
+                    len(frames),
+                    dpi=self.output_config.get("montage_dpi", 150)
+                )
+                # If user asked to show calibrated-only plots, build images and show them
+                if trace_result == "calib":
+                    print("\n=== Building calibrated-only plots (no picks) for montage review ===")
+                    # Build calibrated images for all frames (replace existing list)
+                    self._deferred_calib_images = []
+                    for idx, (l, r) in enumerate(frames):
+                        print(f"Calibrated plot: frame {idx+1}/{len(frames)}")
+                        self._generate_calibrated_only(masked_image, l, r, base_filename, idx + 1, total_frames=len(frames))
+
+                    from utils import show_calibrated_montage
+
+                    calib_res = show_calibrated_montage(self._deferred_calib_images, len(frames), dpi=self.output_config.get("montage_dpi", 150))
+                    if calib_res == "edit":
+                        # Open config for editing then re-detect traces and calibrated plots
+                        print(f"\n{'='*60}")
+                        print(f"Opening config for editing: {self.config_path_resolved}")
+                        print(f"{'='*60}")
+                        try:
+                            os.startfile(self.config_path_resolved)
+                            print("✓ Config file opened in editor")
+                        except Exception as e:
+                            print(f"Could not open config automatically. Please open the file manually: {self.config_path_resolved}")
+                            print(f"Error: {e}")
+
+                        print("\nEdit the config file, SAVE it, and CLOSE the editor.")
+                        print("Then press ENTER in THIS TERMINAL WINDOW to continue.\n")
+                        sys.stdout.flush()
+                        sys.stderr.flush()
+                        os.system("pause")
+                        try:
+                            with open(self.config_path_resolved, 'r') as f:
+                                self.config = json.load(f)
+                        except Exception as e:
+                            print(f"Warning: could not reload config: {e}")
+                        # Update dependent sections
+                        self.processing_params = self.config.get("processing_params", {})
+                        self.physical_params = self.config.get("physical_params", {})
+                        self.output_config = self.config.get("output", {})
+                        self.output_dir = ensure_output_dirs(self.config)
+
+                        # Rebuild trace images and calibrated images for re-review
+                        print(f"\n{'='*60}")
+                        print(f"Step 4: RE-DETECT TRACES & CALIBRATED PLOTS - With updated config")
+                        print(f"{'='*60}")
+                        self._deferred_frame_images = []
+                        self.frame_results = []
+                        self._deferred_calib_images = []
+                        for idx, (left, right) in enumerate(frames):
+                            self._generate_trace_only(masked_image, left, right, base_filename, idx + 1, total_frames=len(frames))
+                            self._generate_calibrated_only(masked_image, left, right, base_filename, idx + 1, total_frames=len(frames))
+                        print("\n✓ Trace + calibrated re-detection complete. Showing updated traces...\n")
+                        # Loop back to the trace montage
+                        continue
+                    else:
+                        # if user closed or saved, return to trace montage for next action
+                        print("Returning to trace montage after calibrated-only review.")
+                        continue
+                
+                if trace_result == "edit":
+                    # User wants to edit config and re-detect traces
+                    print(f"\n{'='*60}")
+                    print(f"Opening config for editing: {self.config_path_resolved}")
+                    print(f"{'='*60}")
+                    try:
+                        os.startfile(self.config_path_resolved)
+                        print("✓ Config file opened in editor")
+                    except Exception as e:
+                        print(f"Could not open config automatically. Please open the file manually: {self.config_path_resolved}")
+                        print(f"Error: {e}")
+                    
+                    print("\nEdit the config file, SAVE it, and CLOSE the editor.")
+                    print("Then press ENTER in THIS TERMINAL WINDOW to continue.\n")
+                    sys.stdout.flush()
+                    sys.stderr.flush()
+                    
+                    # Use os.system() with 'pause' command on Windows - this WILL block and wait for user input
+                    os.system("pause")
+                    try:
+                        with open(self.config_path_resolved, 'r') as f:
+                            self.config = json.load(f)
+                    except Exception as e:
+                        print(f"Warning: could not reload config: {e}")
+                    # Update dependent sections
+                    self.processing_params = self.config.get("processing_params", {})
+                    self.physical_params = self.config.get("physical_params", {})
+                    self.output_config = self.config.get("output", {})
+                    self.output_dir = ensure_output_dirs(self.config)
+                    
+                    # Re-detect traces only (Step 4 again)
+                    print(f"\n{'='*60}")
+                    print(f"Step 4: RE-DETECT TRACES - With updated config")
+                    print(f"{'='*60}")
+                    print(f"DEBUG: Re-detecting with {len(frames)} frames")
+                    self._deferred_frame_images = []
+                    self.frame_results = []  # ✓ CRITICAL: Clear cached frame results so Step 4.5 will reprocess with new config
+                    for idx, (left, right) in enumerate(frames):
+                        print(f"Re-detecting traces: frame {idx+1}/{len(frames)}...")
+                        self._generate_trace_only(masked_image, left, right, base_filename, idx + 1, total_frames=len(frames))
+                    print(f"\n✓ Trace re-detection complete. Showing updated traces...\n")
+                    # Loop back to show trace montage again
+                    continue
+                
+                elif trace_result is None:
+                    print("⚠ Warning: Could not show trace montage, continuing anyway...")
+                    break
+                
+                elif trace_result == "save":
+                    print("✓ User approved traces. Proceeding to full processing...\n")
+                    break
+                
+                else:
+                    print("✗ Trace review cancelled. Processing aborted.")
+                    return
+        else:
+            print("(Skipping trace montage)")
+
+        # Step 4.5: Process frames for full echo detection and picking
+        print(f"{'='*60}")
+        print(f"Step 4.5: PROCESS FRAMES - Full echo detection & picking")
+        print(f"{'='*60}")
+        print(f"Processing {len(frames)} frames for surface/bed echo detection...")
+        print(f"DEBUG: About to process frames, len(frames)={len(frames)}\n")
         for idx, (left, right) in enumerate(frames):
             print(
-                f"\n--- Processing frame {idx + 1}/{len(frames)}: cols {left}-{right} ---"
+                f"--- Processing frame {idx + 1}/{len(frames)}: cols {left}-{right} ---"
             )
-            self._process_frame(masked_image, left, right, base_filename, idx + 1)
+            self._process_frame(masked_image, left, right, base_filename, idx + 1, total_frames=len(frames))
 
-        # Step 5: Export data automatically
-        print(f"\nStep 5: Exporting database (CSV + NPZ)...")
+        print(f"\n✓ All frames processed.\n")
+
+        # If deferring frame plots, show combined montage for user approval before final export
+        if self.interactive_mode and self.defer_frame_plots and len(self._deferred_frame_images) > 0:
+            self._show_montage_and_handle_user_decisions()
+
         self._export_results()
 
         print(f"\n=== Processing Complete for {base_filename} ===")
 
-    def _process_frame(self, masked_image, left, right, base_filename, frame_idx):
-        """Process an individual A-scope frame and store results."""
+    def _generate_trace_only(self, masked_image, left, right, base_filename, frame_idx, total_frames=None):
+        """Generate trace image only (no echo detection/picking).
+        
+        For edge frames (first and last), use asymmetric trimming to preserve boundary signals.
+        Frame 1: Trim left only (keep right edge)
+        Last frame: Trim right only (keep left edge)
+        """
+        try:
+            frame_img = masked_image[:, left:right].copy()
+            h, w = frame_img.shape
+
+            if w <= 0 or h <= 0:
+                return
+
+            # Detect signal
+            from signal_processing import detect_signal_in_frame, trim_signal_trace
+            signal_result = detect_signal_in_frame(frame_img, self.config)
+            if signal_result is None:
+                return
+            
+            signal_x, signal_y = signal_result
+            if len(signal_x) < 10:
+                return
+            
+            # Determine if this is an edge frame and apply asymmetric trimming
+            is_first_frame = (frame_idx == 1)
+            is_last_frame = (total_frames and frame_idx == total_frames)
+            
+            if is_first_frame or is_last_frame:
+                # For edge frames, apply asymmetric trimming from config
+                # left_frac and right_frac define the region to KEEP (as absolute positions)
+                processing_params = self.config.get("processing_params", {})
+                
+                x = np.array(signal_x)
+                y = np.array(signal_y)
+                
+                if is_first_frame:
+                    left_pos_frac = processing_params.get("edge_frame_trim_first_left_frac", 0.09)
+                    right_pos_frac = processing_params.get("edge_frame_trim_first_right_frac", 0.79)
+                    frame_type = "FIRST"
+                else:
+                    left_pos_frac = processing_params.get("edge_frame_trim_last_left_frac", 0.23)
+                    right_pos_frac = processing_params.get("edge_frame_trim_last_right_frac", 0.89)
+                    frame_type = "LAST"
+                
+                print(f"DEBUG: is_first_frame={is_first_frame}, is_last_frame={is_last_frame}, frame_type={frame_type}, frame_idx={frame_idx}, total_frames={total_frames}")
+                
+                # Calculate trace region boundaries as absolute pixel positions
+                left_boundary_px = int(w * left_pos_frac)
+                right_boundary_px = int(w * right_pos_frac)
+                
+                # Create mask for the region to keep
+                if left_boundary_px >= right_boundary_px:
+                    print(f"[TRACE EDGE FRAME {frame_type}] Frame {frame_idx}: WARNING - invalid boundaries (left {left_boundary_px}px >= right {right_boundary_px}px)")
+                    print(f"  Using full signal range as fallback")
+                    mask = np.ones(len(x), dtype=bool)
+                else:
+                    mask = (x >= left_boundary_px) & (x <= right_boundary_px)
+                    print(f"[TRACE EDGE FRAME {frame_type}] Frame {frame_idx}: Keeping region from {left_pos_frac*100:.1f}% ({left_boundary_px}px) to {right_pos_frac*100:.1f}% ({right_boundary_px}px)")
+                    print(f"  Signal x range: {x.min():.1f} to {x.max():.1f}, keeping: {left_boundary_px} to {right_boundary_px}px")
+                
+                if np.any(mask):
+                    signal_x_trim = x[mask]
+                    signal_y_trim = y[mask]
+                    print(f"  Trimmed x range: {signal_x_trim.min():.1f} to {signal_x_trim.max():.1f} ({len(signal_x_trim)} points)")
+                else:
+                    signal_x_trim, signal_y_trim = x, y
+                    print(f"  No points within trim range, using original signal")
+            else:
+                # Normal trimming for non-edge frames
+                trim_result = trim_signal_trace(frame_img, signal_x, signal_y, self.config)
+                if trim_result is None:
+                    return
+                signal_x_trim, signal_y_trim = trim_result
+            
+            # Create simple trace plot
+            fig, ax = plt.subplots(figsize=(12, 4))
+            ax.imshow(frame_img, cmap='gray', aspect='auto')
+            ax.plot(signal_x_trim, signal_y_trim, 'r-', linewidth=2, label='Detected Trace')
+            ax.set_title(f"Frame {frame_idx}: Detected Trace (Preview)")
+            ax.legend(fontsize=8)
+            ax.set_xlabel("X (pixels)")
+            ax.set_ylabel("Y (pixels)")
+            
+            # Store as image
+            buf = io.BytesIO()
+            fig.savefig(buf, format='png', dpi=self.output_config.get("montage_dpi", 150))
+            buf.seek(0)
+            from PIL import Image
+            trace_img = Image.open(buf)
+            self._deferred_frame_images.append(np.array(trace_img).copy())
+            plt.close(fig)
+            
+        except Exception as e:
+            print(f"  Error: {e}")
+
+    def _generate_calibrated_only(self, masked_image, left, right, base_filename, frame_idx, total_frames=None, replace_index=None):
+        """Generate a calibrated (time vs power) plot for this frame without surface/bed picks
+        and store it in self._deferred_calib_images (or replace at replace_index if provided).
+        """
+        try:
+            import matplotlib.pyplot as plt
+            from PIL import Image as PILImage
+
+            frame_img = masked_image[:, left:right].copy()
+            h, w = frame_img.shape
+
+            # Try to detect the signal trace
+            signal_x, signal_y = detect_signal_in_frame(frame_img, self.config)
+            if signal_x is None:
+                # fallback: create a simple frame image
+                fig, ax = plt.subplots(figsize=(10, 4))
+                ax.imshow(frame_img, cmap='gray', aspect='auto')
+                ax.set_title(f"Frame {frame_idx}: (no trace detected)")
+                buf = io.BytesIO()
+                fig.savefig(buf, format='png', dpi=self.output_config.get('montage_dpi',150), bbox_inches='tight')
+                buf.seek(0)
+                img = np.array(PILImage.open(buf).convert('RGB'))
+                buf.close()
+                if replace_index is None:
+                    self._deferred_calib_images.append(img)
+                else:
+                    if 0 <= replace_index < len(self._deferred_calib_images):
+                        self._deferred_calib_images[replace_index] = img
+                    else:
+                        while len(self._deferred_calib_images) < replace_index:
+                            self._deferred_calib_images.append(img)
+                        self._deferred_calib_images.append(img)
+                plt.close(fig)
+                return
+
+            # Trim / clean trace (same as processing)
+            is_first_frame = (frame_idx == 1)
+            is_last_frame = False
+            if total_frames is not None:
+                is_last_frame = (frame_idx == total_frames)
+
+            if is_first_frame or is_last_frame:
+                processing_params = self.config.get('processing_params', {})
+                x = np.array(signal_x)
+                y = np.array(signal_y)
+                h_frame, w_frame = frame_img.shape
+                if is_first_frame:
+                    left_pos_frac = processing_params.get('edge_frame_trim_first_left_frac', 0.09)
+                    right_pos_frac = processing_params.get('edge_frame_trim_first_right_frac', 0.79)
+                else:
+                    left_pos_frac = processing_params.get('edge_frame_trim_last_left_frac', 0.23)
+                    right_pos_frac = processing_params.get('edge_frame_trim_last_right_frac', 0.89)
+
+                left_boundary_px = int(w_frame * left_pos_frac)
+                right_boundary_px = int(w_frame * right_pos_frac)
+                if left_boundary_px >= right_boundary_px:
+                    mask = np.ones(len(x), dtype=bool)
+                else:
+                    mask = (x >= left_boundary_px) & (x <= right_boundary_px)
+
+                if np.any(mask):
+                    signal_x_clean = x[mask]
+                    signal_y_clean = y[mask]
+                else:
+                    signal_x_clean, signal_y_clean = signal_x, signal_y
+            else:
+                res = trim_signal_trace(frame_img, signal_x, signal_y, self.config)
+                if res is None:
+                    signal_x_clean, signal_y_clean = signal_x, signal_y
+                else:
+                    signal_x_clean, signal_y_clean = res
+
+            # Find TX pulse for calibration anchor
+            tx_pulse_col, tx_idx_in_clean = find_tx_pulse(signal_x_clean, signal_y_clean, self.config)
+
+            # Find reference line (y_ref)
+            ref_row = find_reference_line_blackhat(frame_img, base_filename, frame_idx, self.config)
+
+            # If we can't calibrate, fallback to just drawing trace image
+            if tx_pulse_col is None or ref_row is None:
+                fig, ax = plt.subplots(figsize=(10, 4))
+                ax.imshow(frame_img, cmap='gray', aspect='auto')
+                ax.plot(signal_x_clean, signal_y_clean, 'r-', linewidth=2)
+                ax.set_title(f"Frame {frame_idx}: Trace (no calibration available)")
+                buf = io.BytesIO()
+                fig.savefig(buf, format='png', dpi=self.output_config.get('montage_dpi',150), bbox_inches='tight')
+                buf.seek(0)
+                img = np.array(PILImage.open(buf).convert('RGB'))
+                buf.close()
+                if replace_index is None:
+                    self._deferred_calib_images.append(img)
+                else:
+                    if 0 <= replace_index < len(self._deferred_calib_images):
+                        self._deferred_calib_images[replace_index] = img
+                    else:
+                        while len(self._deferred_calib_images) < replace_index:
+                            self._deferred_calib_images.append(img)
+                        self._deferred_calib_images.append(img)
+                plt.close(fig)
+                return
+
+            # Detect grid and interpolate to compute calibration factors
+            h_peaks_initial, v_peaks_initial, h_minor_peaks, v_minor_peaks = detect_grid_lines_and_dotted(frame_img, self.config)
+            # Determine dynamic y/x ranges similar to full processing
+            y_major, y_minor = interpolate_regular_grid(h, h_peaks_initial, ref_row, self.physical_params['y_major_dB'], self.physical_params['y_minor_per_major'], 8.25 * 10, is_y_axis=True, config=self.config)
+            x_range_us = self.physical_params.get('x_range_factor') * self.physical_params.get('x_major_us')
+            x_major, x_minor = interpolate_regular_grid(w, v_peaks_initial, tx_pulse_col, self.physical_params['x_major_us'], self.physical_params['x_minor_per_major'], x_range_us, is_y_axis=False, config=self.config)
+
+            px_per_us_echo, px_per_db_echo = self._calculate_calibration_factors(x_major, y_major, w, h)
+
+            # Calibrate values
+            power_vals = self.physical_params['y_ref_dB'] - (signal_y_clean - ref_row) / px_per_db_echo
+            time_vals = (signal_x_clean - tx_pulse_col) / px_per_us_echo
+
+            # Plot calibrated power vs time WITHOUT surface/bed picks
+            fig, ax = plt.subplots(figsize=(10, 4))
+            ax.plot(time_vals, power_vals, color='red', linewidth=1.5)
+            ax.set_title(f"Calibrated A-scope Frame {frame_idx}")
+            ax.set_xlabel('One-way travel time (µs)')
+            ax.set_ylabel('Power (dB)')
+            ax.grid(True, alpha=0.3)
+
+            # Plot Tx marker if available
+            if tx_idx_in_clean is not None and tx_idx_in_clean < len(time_vals):
+                ax.plot(time_vals[tx_idx_in_clean], power_vals[tx_idx_in_clean], 'o', color='blue', markersize=6, label='Tx')
+
+            # Add legend for Tx only
+            handles, labels = ax.get_legend_handles_labels()
+            if handles:
+                ax.legend(loc='upper right')
+
+            buf = io.BytesIO()
+            fig.savefig(buf, format='png', dpi=self.output_config.get('montage_dpi',150), bbox_inches='tight')
+            buf.seek(0)
+            img = np.array(PILImage.open(buf).convert('RGB'))
+            buf.close()
+
+            if replace_index is None:
+                self._deferred_calib_images.append(img)
+            else:
+                if 0 <= replace_index < len(self._deferred_calib_images):
+                    self._deferred_calib_images[replace_index] = img
+                else:
+                    while len(self._deferred_calib_images) < replace_index:
+                        self._deferred_calib_images.append(img)
+                    self._deferred_calib_images.append(img)
+
+            plt.close(fig)
+
+        except Exception as e:
+            print(f"  Error (calib image): {e}")
+
+    def _process_frame(self, masked_image, left, right, base_filename, frame_idx, total_frames=None):
+        """Process an individual A-scope frame and store results.
+        
+        For edge frames (1st and last), uses asymmetric trimming to preserve boundary signals.
+        """
         # Initialize frame result structure
         # Get CBD and navigation data
         cbd = self.cbd_list[frame_idx - 1] if frame_idx <= len(self.cbd_list) else np.nan
@@ -355,6 +914,8 @@ class AScope:
             "Transmitter_Time_us": np.nan,
             "Transmitter_Power_dB": np.nan,
             "Transmitter_X_pixel": np.nan,
+            "Noise_Floor_Time_us": np.nan,
+            "Noise_Floor_Power_dB": np.nan,
         }
 
         try:
@@ -377,9 +938,53 @@ class AScope:
             signal_y = adaptive_peak_preserving_smooth(signal_y, self.config)
 
             # 2. Clean Signal Trace
-            signal_x_clean, signal_y_clean = trim_signal_trace(
-                frame_img, signal_x, signal_y, self.config
-            )
+            # For edge frames, use asymmetric trimming
+            is_first_frame = (frame_idx == 1)
+            is_last_frame = (total_frames and frame_idx == total_frames)
+            
+            print(f"DEBUG: frame_idx={frame_idx}, total_frames={total_frames}, is_last_frame={is_last_frame}")
+            
+            if is_first_frame or is_last_frame:
+                # Apply asymmetric trimming for edge frames
+                # left_frac and right_frac define the region to KEEP (as absolute positions)
+                processing_params = self.config.get("processing_params", {})
+                x = np.array(signal_x)
+                y = np.array(signal_y)
+                h_frame, w_frame = frame_img.shape
+                
+                if is_first_frame:
+                    left_pos_frac = processing_params.get("edge_frame_trim_first_left_frac", 0.09)
+                    right_pos_frac = processing_params.get("edge_frame_trim_first_right_frac", 0.79)
+                    frame_type = "FIRST"
+                else:
+                    left_pos_frac = processing_params.get("edge_frame_trim_last_left_frac", 0.23)
+                    right_pos_frac = processing_params.get("edge_frame_trim_last_right_frac", 0.89)
+                    frame_type = "LAST"
+                
+                # Calculate trace region boundaries as absolute pixel positions
+                left_boundary_px = int(w_frame * left_pos_frac)
+                right_boundary_px = int(w_frame * right_pos_frac)
+                
+                # Create mask for the region to keep
+                if left_boundary_px >= right_boundary_px:
+                    print(f"[EDGE FRAME {frame_type}] Frame {frame_idx}: WARNING - invalid boundaries (left {left_boundary_px}px >= right {right_boundary_px}px)")
+                    print(f"  Using full signal range as fallback")
+                    mask = np.ones(len(x), dtype=bool)
+                else:
+                    mask = (x >= left_boundary_px) & (x <= right_boundary_px)
+                    print(f"[EDGE FRAME {frame_type}] Frame {frame_idx}: Keeping region from {left_pos_frac*100:.1f}% ({left_boundary_px}px) to {right_pos_frac*100:.1f}% ({right_boundary_px}px)")
+                    print(f"  Signal x range: {x.min():.1f} to {x.max():.1f}, keeping: {left_boundary_px} to {right_boundary_px}px")
+                
+                if np.any(mask):
+                    signal_x_clean = x[mask]
+                    signal_y_clean = y[mask]
+                else:
+                    signal_x_clean, signal_y_clean = signal_x, signal_y
+            else:
+                # Normal trimming for non-edge frames
+                signal_x_clean, signal_y_clean = trim_signal_trace(
+                    frame_img, signal_x, signal_y, self.config
+                )
 
             if len(signal_x_clean) == 0:
                 print(
@@ -431,9 +1036,11 @@ class AScope:
             )
 
             # 5. Detect Grid Lines (for interpolation)
-            qa_path = (
-                f"{self.output_dir}/{base_filename}_frame{frame_idx:02d}_grid_QA.png"
-            )
+            # Only request grid QA plot when explicitly enabled in config or debug mode
+            qa_path = None
+            if self.output_config.get("save_grid_qa", False) or self.debug_mode:
+                qa_path = f"{self.output_dir}/{base_filename}_frame{frame_idx:02d}_grid_QA.png"
+
             h_peaks_initial, v_peaks_initial, h_minor_peaks, v_minor_peaks = (
                 detect_grid_lines_and_dotted(
                     frame_img, self.config, qa_plot_path=qa_path, ref_row_for_qa=ref_row
@@ -583,6 +1190,24 @@ class AScope:
                     f"Transmitter pulse stored: {tx_time:.2f} μs, {tx_power:.1f} dB, X-pixel: {tx_pulse_col:.1f}"
                 )
 
+            # Store Noise Floor Results
+            if time_vals is not None and power_vals is not None and len(time_vals) > 0:
+                processing_params = self.config.get("processing_params", {})
+                noise_floor_start_time = processing_params.get("noise_floor_window_start_us", 5.0)
+                noise_floor_end_time = processing_params.get("noise_floor_window_end_us", 6.2)
+                
+                noise_floor_mask = (time_vals >= noise_floor_start_time) & (time_vals <= noise_floor_end_time)
+                if np.any(noise_floor_mask):
+                    noise_floor_region = power_vals[noise_floor_mask]
+                    noise_floor_power = np.min(noise_floor_region)
+                    min_idx_in_window = np.argmin(noise_floor_region)
+                    noise_floor_time = time_vals[noise_floor_mask][min_idx_in_window]
+                    
+                    frame_result["Noise_Floor_Time_us"] = noise_floor_time
+                    frame_result["Noise_Floor_Power_dB"] = noise_floor_power
+                    
+                    print(f"Noise floor detected: {noise_floor_time:.2f} μs, {noise_floor_power:.1f} dB")
+
             # 10. Plot Combined Results (renamed to "picked.png")
             self._plot_combined_results(
                 frame_img,
@@ -603,6 +1228,7 @@ class AScope:
                 time_vals,
                 px_per_us_echo,
                 px_per_db_echo,
+                replace_index=frame_idx-1,  # Replace the trace image with picked image
             )
 
         except Exception as e:
@@ -625,6 +1251,11 @@ class AScope:
         """
         try:
             # Extract the frame
+            if masked_image is None:
+                # When re-running per-frame processing without full image, try to load image from original
+                # The calling code must ensure frame_img is available; here we cannot proceed
+                print("ERROR: masked_image is None in _process_frame_for_override")
+                return None
             frame_img = masked_image[:, left:right].copy()
             h, w = frame_img.shape
 
@@ -656,9 +1287,50 @@ class AScope:
                 return None
 
             signal_y = adaptive_peak_preserving_smooth(signal_y, self.config)
-            signal_x_clean, signal_y_clean = trim_signal_trace(
-                frame_img, signal_x, signal_y, self.config
-            )
+            
+            # Apply edge frame asymmetric trimming if applicable
+            is_first_frame = (frame_idx == 1)
+            is_last_frame = (frame_idx == len(self.frames))
+            
+            if is_first_frame or is_last_frame:
+                # Apply asymmetric edge frame trimming
+                # left_frac and right_frac define the region to KEEP (as absolute positions)
+                processing_params = self.config.get("processing_params", {})
+                x = np.array(signal_x)
+                y = np.array(signal_y)
+                h_frame, w_frame = frame_img.shape
+                
+                if is_first_frame:
+                    left_pos_frac = processing_params.get("edge_frame_trim_first_left_frac", 0.09)
+                    right_pos_frac = processing_params.get("edge_frame_trim_first_right_frac", 0.79)
+                    frame_type = "FIRST"
+                else:  # is_last_frame
+                    left_pos_frac = processing_params.get("edge_frame_trim_last_left_frac", 0.23)
+                    right_pos_frac = processing_params.get("edge_frame_trim_last_right_frac", 0.89)
+                    frame_type = "LAST"
+                
+                # Calculate trace region boundaries as absolute pixel positions
+                left_boundary_px = int(w_frame * left_pos_frac)
+                right_boundary_px = int(w_frame * right_pos_frac)
+                
+                # Create mask for the region to keep
+                if left_boundary_px >= right_boundary_px:
+                    print(f"[OVERRIDE {frame_type} FRAME] Frame {frame_idx}: WARNING - invalid boundaries (left {left_boundary_px}px >= right {right_boundary_px}px)")
+                    print(f"  Using full signal range as fallback")
+                    signal_x_clean = x
+                    signal_y_clean = y
+                else:
+                    mask = (x >= left_boundary_px) & (x <= right_boundary_px)
+                    if np.any(mask):
+                        signal_x_clean = x[mask]
+                        signal_y_clean = y[mask]
+                    else:
+                        signal_x_clean, signal_y_clean = signal_x, signal_y
+            else:
+                # Normal trimming for non-edge frames
+                signal_x_clean, signal_y_clean = trim_signal_trace(
+                    frame_img, signal_x, signal_y, self.config
+                )
 
             if len(signal_x_clean) == 0:
                 print(f"No valid signal trace for frame {frame_idx}")
@@ -825,18 +1497,460 @@ class AScope:
 
         return px_per_us, px_per_db
 
+    def _show_montage_and_handle_user_decisions(self):
+        """Create montage from deferred per-frame images, show to user, and handle
+        approval, manual repicks, or config edits using the new interactive montage viewer.
+        Shows all frames processed, regardless of pick status.
+        """
+        try:
+            # Show all frames (no filtering)
+            imgs = []
+            frame_mapping = []  # Maps montage index to original frame index
+            for i, frame_result in enumerate(self.frame_results):
+                if i < len(self._deferred_frame_images):
+                    imgs.append(self._deferred_frame_images[i])
+                    frame_mapping.append(i + 1)  # 1-based frame number
+            
+            n = len(imgs)
+            if n == 0:
+                print("No frames available for montage.")
+                print(f"Total frames processed: {len(self.frame_results)}")
+                return
+
+            total_processed = len(self.frame_results)
+            print(f"\n{'='*60}")
+            print(f"INTERACTIVE MONTAGE REVIEW: {n} frames with picks detected")
+            print(f"{'='*60}")
+
+            # Use the new interactive montage viewer
+            if HAVE_QT:
+                try:
+                    from functions.interactive_montage_viewer import show_interactive_montage
+
+                    montage_dpi = self.output_config.get("montage_dpi", self.output_config.get("plot_dpi", 150))
+                    choice, selected_frames = show_interactive_montage(imgs, n, montage_dpi)
+
+                    if choice == "save":
+                        print("User approved - saving all frames...")
+                        self._save_deferred_images_to_disk()
+                        return
+
+                    elif choice == "repick":
+                        # User selected specific frames to repick
+                        # selected_frames are 1-based frame numbers from the montage dialog, convert to 0-based indices
+                        if selected_frames:
+                            # Convert 1-based frame numbers to 0-based indices, then map to original frame numbers
+                            original_frame_nums = [frame_mapping[idx-1] for idx in selected_frames if 1 <= idx <= len(frame_mapping)]
+                            print(f"User selected frames for repicking: {original_frame_nums}")
+                            selected_frames = original_frame_nums
+                        else:
+                            print("No frames selected for repicking")
+                            return
+
+                    elif choice == "edit":
+                        # User wants to edit config
+                        print("User selected 'Edit config and re-run'")
+                        choice = '2'
+
+                    else:
+                        # Dialog cancelled
+                        print("Montage review cancelled")
+                        return
+
+                except ImportError as e:
+                    print(f"Could not import interactive montage viewer: {e}")
+                    print("Falling back to matplotlib...")
+                    choice = None
+                except Exception as e:
+                    print(f"Interactive montage viewer failed: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    choice = None
+            else:
+                choice = None
+
+            if choice is None:
+                # Fallback to matplotlib + console
+                try:
+                    import matplotlib.pyplot as plt
+                    axes_cols = min(6, n)
+                    axes_rows = int(np.ceil(n / axes_cols))
+                    fig, axes = plt.subplots(axes_rows, axes_cols, figsize=(4 * axes_cols, 3 * axes_rows))
+                    axes_flat = axes.flatten() if hasattr(axes, 'flatten') else [axes]
+                    for i in range(axes_rows * axes_cols):
+                        ax = axes_flat[i]
+                        ax.axis('off')
+                        if i < n:
+                            ax.imshow(imgs[i])
+                            ax.set_title(f"Frame {frame_mapping[i]}")
+                    plt.suptitle('Per-frame picks montage (only frames with valid picks)')
+                    plt.tight_layout()
+                    plt.show()
+                except Exception:
+                    pass
+
+                resp = input("Are you satisfied with the per-frame picks? (Y/N): ").strip().upper()
+                if resp == 'Y':
+                    self._save_deferred_images_to_disk()
+                    return
+
+                print("Options:\n1) Manual repick frames\n2) Edit config and re-run per-frame processing (skip frame detection)")
+                choice = input("Choose option 1 or 2: ").strip()
+                selected_frames = []
+
+            if choice == '1' or (isinstance(choice, str) and choice == 'repick'):
+                # Get frames to repick
+                if isinstance(choice, str) and choice == 'repick' and selected_frames:
+                    frame_nums = selected_frames
+                else:
+                    frames_input = input("Enter comma-separated frame numbers to repick (1-based): ")
+                    try:
+                        frame_nums = [int(x.strip()) for x in frames_input.split(',') if x.strip()]
+                    except Exception:
+                        print("Invalid input. Aborting repick flow.")
+                        return
+
+                for fnum in frame_nums:
+                    if fnum < 1 or fnum > len(self.frames):
+                        print(f"Frame {fnum} out of range, skipping")
+                        continue
+                    left, right = self.frames[fnum - 1]
+                    frame_data = self._process_frame_for_override(self._last_masked_image, left, right, self.base_filename, fnum)
+                    if frame_data is None:
+                        print(f"Could not prepare frame {fnum} for override")
+                        continue
+                    
+                    # Retrieve existing noise floor pick if available
+                    existing_noise_floor_idx = None
+                    if fnum - 1 < len(self.frame_results):
+                        frame_result = self.frame_results[fnum - 1]
+                        # Try to find the noise floor index by matching time value
+                        if not np.isnan(frame_result.get("Noise_Floor_Time_us")):
+                            noise_floor_time = frame_result["Noise_Floor_Time_us"]
+                            # Find closest index in time_vals
+                            distances = np.abs(frame_data["time_vals"] - noise_floor_time)
+                            existing_noise_floor_idx = np.argmin(distances)
+                            print(f"DEBUG: Retrieved existing noise floor pick: {noise_floor_time:.2f} μs at index {existing_noise_floor_idx}")
+                            print(f"DEBUG: Closest match in current frame_data: {frame_data['time_vals'][existing_noise_floor_idx]:.2f} μs")
+                    
+                    from functions.interactive_override import ManualPickOverride
+
+                    override_session = ManualPickOverride(
+                        frame_data["frame_img"],
+                        frame_data["signal_x_clean"],
+                        frame_data["signal_y_clean"],
+                        frame_data["power_vals"],
+                        frame_data["time_vals"],
+                        frame_data["tx_idx"],
+                        frame_data["surface_idx"],
+                        frame_data["bed_idx"],
+                        self.base_filename,
+                        fnum,
+                        self.config,
+                        noise_floor_idx=existing_noise_floor_idx,
+                    )
+                    manual_tx, manual_surf, manual_bed, manual_noise_floor, overrides = override_session.start_interactive_session()
+                    success = self._save_frame_with_manual_picks(
+                        frame_data, manual_tx, manual_surf, manual_bed, manual_noise_floor, overrides, self.base_filename, fnum
+                    )
+                    if success:
+                        # regenerate deferred image for this frame
+                        try:
+                            self._plot_combined_results(
+                                frame_data["frame_img"],
+                                frame_data["signal_x_clean"],
+                                frame_data["signal_y_clean"],
+                                [], [], [], [],
+                                frame_data["calibration_data"]["ref_row"],
+                                self.base_filename,
+                                fnum,
+                                frame_data["calibration_data"]["tx_pulse_col"],
+                                manual_tx,
+                                manual_surf,
+                                manual_bed,
+                                frame_data["power_vals"],
+                                frame_data["time_vals"],
+                                frame_data["calibration_data"].get("px_per_us_echo"),
+                                frame_data["calibration_data"].get("px_per_db_echo"),
+                                replace_index=fnum-1,
+                                noise_floor_idx_in_clean=manual_noise_floor,
+                            )
+                        except Exception as e:
+                            print(f"Warning: could not regenerate deferred image for frame {fnum}: {e}")
+
+                # Reload the repicked frames from disk into the deferred images cache
+                print("Reloading updated frame images from disk...")
+                for fnum in frame_nums:
+                    if 1 <= fnum <= len(self.frames):
+                        frame_idx = fnum - 1
+                        plot_filename = f"{self.output_dir}/{self.base_filename}_frame{fnum:02d}_picked.png"
+                        if os.path.exists(plot_filename):
+                            try:
+                                img = Image.open(plot_filename)
+                                if frame_idx < len(self._deferred_frame_images):
+                                    self._deferred_frame_images[frame_idx] = img
+                                    print(f"  Reloaded frame {fnum} image from disk")
+                            except Exception as e:
+                                print(f"  Warning: could not reload image for frame {fnum}: {e}")
+
+                # After repicks, show montage again
+                self._show_montage_and_handle_user_decisions()
+
+            elif choice == '2':
+                print(f"Opening config for editing: {self.config_path_resolved}")
+                try:
+                    os.startfile(self.config_path_resolved)
+                except Exception:
+                    print("Could not open config automatically. Please open the file manually:", self.config_path_resolved)
+                input("Edit the config as needed, save, then press Enter to continue...")
+                try:
+                    with open(self.config_path_resolved, 'r') as f:
+                        self.config = json.load(f)
+                except Exception as e:
+                    print(f"Warning: could not reload config: {e}")
+                # Update dependent sections
+                self.processing_params = self.config.get("processing_params", {})
+                self.physical_params = self.config.get("physical_params", {})
+                self.output_config = self.config.get("output", {})
+                self.output_dir = ensure_output_dirs(self.config)
+
+                # Re-run per-frame processing (skip frame detection)
+                print("Re-running per-frame processing with updated config...")
+                self.frame_results = []
+                self._deferred_frame_images = []
+                for idx, (left, right) in enumerate(self.frames):
+                    print(f"Re-processing frame {idx+1}/{len(self.frames)}...")
+                    self._process_frame(self._last_masked_image, left, right, self.base_filename, idx + 1, total_frames=len(self.frames))
+
+                # Show montage again
+                self._show_montage_and_handle_user_decisions()
+
+            else:
+                print("Invalid choice. Aborting interactive adjustments.")
+
+        except Exception as e:
+            print(f"Error during montage/approval flow: {e}")
+
+    def _save_deferred_images_to_disk(self):
+        """Write in-memory deferred images to disk as per-frame picked PNGs.
+        Saves all frames with images available (not filtered by pick validity).
+        """
+        try:
+            from PIL import Image
+            saved_count = 0
+            for i, frame_result in enumerate(self.frame_results):
+                if i >= len(self._deferred_frame_images):
+                    continue  # Skip if no image available
+                
+                img = self._deferred_frame_images[i]
+                fname = Path(self.output_dir) / f"{self.base_filename}_frame{i+1:02d}_picked.png"
+                if img.dtype == np.uint8:
+                    out_img = Image.fromarray(img)
+                else:
+                    out_img = Image.fromarray((img).astype(np.uint8))
+                out_img.save(str(fname))
+                print(f"Saved deferred plot: {fname}")
+                saved_count += 1
+            
+            print(f"\nSaved {saved_count} frames with images to disk.")
+        except Exception as e:
+            print(f"Warning: could not save deferred images to disk: {e}")
+
+    # --- PyQt5 helper dialogs ---
+    def _qt_init_app(self):
+        if not HAVE_QT:
+            return None
+        if self._qt_app is None:
+            self._qt_app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        return self._qt_app
+
+    def _qt_show_image_yesno(self, image_path, window_title, prompt_text):
+        """Show an image in a modal PyQt5 dialog with Yes/No buttons. Returns True for Yes."""
+        app = self._qt_init_app()
+        if app is None:
+            raise RuntimeError("PyQt5 not available")
+
+        dialog = QtWidgets.QDialog()
+        dialog.setWindowTitle(window_title)
+        dialog.setModal(True)
+        dialog.setGeometry(100, 100, 1200, 600)  # Set reasonable size
+        
+        vbox = QtWidgets.QVBoxLayout()
+
+        label = QtWidgets.QLabel(prompt_text)
+        vbox.addWidget(label)
+
+        pix = QtGui.QPixmap(image_path)
+        img_label = QtWidgets.QLabel()
+        # Scale image to fit in dialog
+        scaled_pix = pix.scaledToWidth(1100, QtCore.Qt.SmoothTransformation)
+        img_label.setPixmap(scaled_pix)
+        vbox.addWidget(img_label, 1)  # Give it stretch factor
+
+        hbox = QtWidgets.QHBoxLayout()
+        btn_yes = QtWidgets.QPushButton("Yes")
+        btn_no = QtWidgets.QPushButton("No")
+        hbox.addWidget(btn_yes)
+        hbox.addWidget(btn_no)
+        vbox.addLayout(hbox)
+
+        dialog.setLayout(vbox)
+
+        result = {'ok': None}
+
+        def on_yes():
+            result['ok'] = True
+            dialog.accept()
+
+        def on_no():
+            result['ok'] = False
+            dialog.accept()
+
+        btn_yes.clicked.connect(on_yes)
+        btn_no.clicked.connect(on_no)
+
+        # Show dialog and process events
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        print(f"DEBUG: Dialog shown, calling exec_()...")
+        exit_code = dialog.exec_()
+        print(f"DEBUG: Dialog exec_() returned with exit_code={exit_code}, result['ok']={result['ok']}")
+        return bool(result['ok'])
+
+    def _qt_show_montage_dialog(self, pil_image, title="Montage"):
+        """Show a PIL.Image montage and return action: 'yes', 'repick', 'edit', or None on failure."""
+        app = self._qt_init_app()
+        if app is None:
+            raise RuntimeError("PyQt5 not available")
+        # Convert PIL image to QPixmap
+        data = pil_image.tobytes("raw", "RGB")
+        qimg = QtGui.QImage(data, pil_image.width, pil_image.height, QtGui.QImage.Format_RGB888)
+        pix = QtGui.QPixmap.fromImage(qimg)
+
+        # Create a custom dialog class that rescales the displayed pixmap from the
+        # original high-resolution pixmap on resize events using SmoothTransformation.
+        class MontageDialog(QtWidgets.QDialog):
+            def __init__(self, pixmap, title):
+                super(MontageDialog, self).__init__()
+                self.setWindowTitle(title)
+                self._orig_pix = pixmap
+                self._user_scale = 1.0
+
+                self.vbox = QtWidgets.QVBoxLayout()
+
+                self.scroll = QtWidgets.QScrollArea()
+                self.img_label = QtWidgets.QLabel()
+                self.img_label.setAlignment(QtCore.Qt.AlignCenter)
+                # Do not allow QLabel to auto-scale contents; we'll set pixmap manually
+                self.img_label.setScaledContents(False)
+                self.scroll.setWidget(self.img_label)
+                self.scroll.setWidgetResizable(True)
+                self.vbox.addWidget(self.scroll)
+
+                # Controls
+                ctrl_hbox = QtWidgets.QHBoxLayout()
+                self.btn_zoom_in = QtWidgets.QPushButton("Zoom +")
+                self.btn_zoom_out = QtWidgets.QPushButton("Zoom -")
+                self.btn_reset = QtWidgets.QPushButton("Reset")
+                ctrl_hbox.addWidget(self.btn_zoom_in)
+                ctrl_hbox.addWidget(self.btn_zoom_out)
+                ctrl_hbox.addWidget(self.btn_reset)
+                self.vbox.addLayout(ctrl_hbox)
+
+                lbl = QtWidgets.QLabel("Are you satisfied with the per-frame picks?")
+                self.vbox.addWidget(lbl)
+
+                hbox = QtWidgets.QHBoxLayout()
+                self.btn_yes = QtWidgets.QPushButton("Yes - save all")
+                self.btn_repick = QtWidgets.QPushButton("Manual repick frames")
+                self.btn_edit = QtWidgets.QPushButton("Edit config and re-run")
+                hbox.addWidget(self.btn_yes)
+                hbox.addWidget(self.btn_repick)
+                hbox.addWidget(self.btn_edit)
+                self.vbox.addLayout(hbox)
+
+                self.setLayout(self.vbox)
+
+                # Connections
+                self.btn_zoom_in.clicked.connect(self.on_zoom_in)
+                self.btn_zoom_out.clicked.connect(self.on_zoom_out)
+                self.btn_reset.clicked.connect(self.on_reset)
+
+                self.btn_yes.clicked.connect(self.on_yes)
+                self.btn_repick.clicked.connect(self.on_repick)
+                self.btn_edit.clicked.connect(self.on_edit)
+
+                self._choice = None
+
+                # Initial paint
+                self._update_display()
+
+            def _update_display(self):
+                # Compute available viewport size
+                avail_size = self.scroll.viewport().size()
+                if self._orig_pix.isNull():
+                    return
+                orig_w = self._orig_pix.width()
+                orig_h = self._orig_pix.height()
+
+                # Fit-to-window scale
+                fit_scale_w = avail_size.width() / orig_w if orig_w > 0 else 1.0
+                fit_scale_h = avail_size.height() / orig_h if orig_h > 0 else 1.0
+                fit_scale = min(fit_scale_w, fit_scale_h)
+                # Use base scale equal to fit_scale (so image fills available area), allow user scaling on top
+                target_scale = max(0.01, fit_scale * self._user_scale)
+                new_w = max(1, int(orig_w * target_scale))
+                new_h = max(1, int(orig_h * target_scale))
+                scaled = self._orig_pix.scaled(new_w, new_h, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
+                self.img_label.setPixmap(scaled)
+
+            def resizeEvent(self, ev):
+                super(MontageDialog, self).resizeEvent(ev)
+                self._update_display()
+
+            def on_zoom_in(self):
+                self._user_scale *= 1.25
+                self._update_display()
+
+            def on_zoom_out(self):
+                self._user_scale /= 1.25
+                self._update_display()
+
+            def on_reset(self):
+                self._user_scale = 1.0
+                self._update_display()
+
+            def on_yes(self):
+                self._choice = 'yes'
+                self.accept()
+
+            def on_repick(self):
+                self._choice = 'repick'
+                self.accept()
+
+            def on_edit(self):
+                self._choice = 'edit'
+                self.accept()
+
+        dlg = MontageDialog(pix, title)
+        dlg.exec_()
+        return dlg._choice
+
     def _save_frame_with_manual_picks(
         self,
         frame_data,
         manual_tx,
         manual_surface,
         manual_bed,
+        manual_noise_floor,
         overrides,
         base_filename,
         frame_idx,
     ):
         """
         Save frame results with manual pick overrides and update main database files.
+        Also updates self.frame_results so final export has manual picks.
         """
         try:
             # Get CBD
@@ -869,6 +1983,8 @@ class AScope:
                 "Transmitter_Time_us": np.nan,
                 "Transmitter_Power_dB": np.nan,
                 "Transmitter_X_pixel": np.nan,
+                "Noise_Floor_Time_us": np.nan,
+                "Noise_Floor_Power_dB": np.nan,
             }
 
             # Extract data
@@ -890,6 +2006,26 @@ class AScope:
                 frame_result["Transmitter_X_pixel"] = frame_data["calibration_data"][
                     "tx_pulse_col"
                 ]
+
+            # Store noise floor if manually picked, otherwise recalculate automatically
+            if manual_noise_floor is not None and manual_noise_floor < len(time_vals):
+                frame_result["Noise_Floor_Time_us"] = time_vals[manual_noise_floor]
+                frame_result["Noise_Floor_Power_dB"] = power_vals[manual_noise_floor]
+                print(f"DEBUG: Saving manual noise floor at index {manual_noise_floor}: {time_vals[manual_noise_floor]:.2f} μs, {power_vals[manual_noise_floor]:.1f} dB")
+            else:
+                # Recalculate noise floor automatically if not manually repicked
+                processing_params = self.config.get("processing_params", {})
+                noise_floor_start_time = processing_params.get("noise_floor_window_start_us", 5.0)
+                noise_floor_end_time = processing_params.get("noise_floor_window_end_us", 6.2)
+                
+                noise_floor_mask = (time_vals >= noise_floor_start_time) & (time_vals <= noise_floor_end_time)
+                if np.any(noise_floor_mask):
+                    noise_floor_region = power_vals[noise_floor_mask]
+                    noise_floor_power = np.min(noise_floor_region)
+                    min_idx_in_window = np.argmin(noise_floor_region)
+                    noise_floor_time = time_vals[noise_floor_mask][min_idx_in_window]
+                    frame_result["Noise_Floor_Time_us"] = noise_floor_time
+                    frame_result["Noise_Floor_Power_dB"] = noise_floor_power
 
             # Calculate ice thickness
             if not np.isnan(frame_result["Surface_Time_us"]) and not np.isnan(
@@ -914,8 +2050,20 @@ class AScope:
                 print(
                     f"  Bed: {frame_result['Bed_Time_us']:.2f} μs {'(Manual)' if overrides.get('bed') else '(Auto)'}"
                 )
+            if not np.isnan(frame_result["Noise_Floor_Time_us"]):
+                print(
+                    f"  Noise Floor: {frame_result['Noise_Floor_Time_us']:.2f} μs {'(Manual)' if overrides.get('noise_floor') else '(Auto)'}"
+                )
             if not np.isnan(frame_result["Ice_Thickness_m"]):
                 print(f"  Ice thickness: {frame_result['Ice_Thickness_m']:.1f} m")
+
+            # UPDATE self.frame_results with manual picks so final export includes them
+            if frame_idx - 1 < len(self.frame_results):
+                print(f"DEBUG: Updating self.frame_results[{frame_idx-1}] with manual picks")
+                self.frame_results[frame_idx - 1].update(frame_result)
+            else:
+                print(f"WARNING: Frame {frame_idx} not in self.frame_results, appending new entry")
+                self.frame_results.append(frame_result)
 
             # Update the main CSV file
             main_csv_path = Path(self.output_dir) / f"{base_filename}_pick.csv"
@@ -1136,7 +2284,8 @@ class AScope:
         time_vals,
         px_per_us,
         px_per_db,
-    ):
+        replace_index=None,
+        noise_floor_idx_in_clean=None):
         """Generate and save a combined plot with debug view and calibrated view."""
         h, w = frame_img.shape
 
@@ -1258,6 +2407,42 @@ class AScope:
                     ms=6,
                     label="Bed",
                 )
+
+            # Plot noise floor on debug view
+            if time_vals is not None and len(time_vals) > 0:
+                # Use manual pick if provided, otherwise calculate automatically
+                if noise_floor_idx_in_clean is not None and noise_floor_idx_in_clean < len(signal_x_clean):
+                    ax_debug.plot(
+                        signal_x_clean[noise_floor_idx_in_clean],
+                        signal_y_clean[noise_floor_idx_in_clean],
+                        "o",
+                        color="orange",
+                        ms=6,
+                        label="NF",
+                    )
+                else:
+                    # Calculate automatically from time window
+                    processing_params = self.config.get("processing_params", {})
+                    noise_floor_start_time = processing_params.get("noise_floor_window_start_us", 5.0)
+                    noise_floor_end_time = processing_params.get("noise_floor_window_end_us", 6.2)
+                    
+                    noise_floor_mask = (time_vals >= noise_floor_start_time) & (time_vals <= noise_floor_end_time)
+                    if np.any(noise_floor_mask):
+                        noise_floor_region = power_vals[noise_floor_mask]
+                        min_idx_in_window = np.argmin(noise_floor_region)
+                        # Find the actual index in the full time_vals array
+                        noise_floor_indices = np.where(noise_floor_mask)[0]
+                        noise_floor_idx_in_clean_auto = noise_floor_indices[min_idx_in_window]
+                        
+                        if noise_floor_idx_in_clean_auto < len(signal_x_clean):
+                            ax_debug.plot(
+                                signal_x_clean[noise_floor_idx_in_clean_auto],
+                                signal_y_clean[noise_floor_idx_in_clean_auto],
+                                "o",
+                                color="orange",
+                                ms=6,
+                                label="NF",
+                            )
 
         ax_debug.set_title(f"A-scope Frame {frame_idx} (Debug View)")
         ax_debug.set_ylim(h, 0)
@@ -1392,6 +2577,38 @@ class AScope:
 
         # Annotate echoes on calibrated plot
         if valid_signal and time_vals is not None and len(time_vals) > 0:
+            # Calculate noise floor mask upfront (used for both manual and automatic)
+            processing_params = self.config.get("processing_params", {})
+            noise_floor_start_time = processing_params.get("noise_floor_window_start_us", 5.0)
+            noise_floor_end_time = processing_params.get("noise_floor_window_end_us", 6.2)
+            noise_floor_mask = (time_vals >= noise_floor_start_time) & (time_vals <= noise_floor_end_time)
+            
+            # Use manual noise floor pick if provided, otherwise calculate automatically
+            noise_floor_power = None
+            noise_floor_time = None
+            
+            if noise_floor_idx_in_clean is not None and noise_floor_idx_in_clean < len(time_vals):
+                noise_floor_time = time_vals[noise_floor_idx_in_clean]
+                noise_floor_power = power_vals[noise_floor_idx_in_clean]
+            else:
+                # Calculate noise floor automatically from config time window
+                if np.any(noise_floor_mask):
+                    noise_floor_region = power_vals[noise_floor_mask]
+                    noise_floor_power = np.min(noise_floor_region)
+                    min_idx_in_window = np.argmin(noise_floor_region)
+                    noise_floor_time = time_vals[noise_floor_mask][min_idx_in_window]
+            
+            # Plot the noise floor marker if we have it
+            if noise_floor_time is not None and noise_floor_power is not None:
+                ax_calib.plot(
+                    noise_floor_time,
+                    noise_floor_power,
+                    "o",
+                    color="orange",
+                    label="Noise Floor",
+                    markersize=6,
+                )
+            
             if tx_idx_in_clean is not None and tx_idx_in_clean < len(time_vals):
                 ax_calib.plot(
                     time_vals[tx_idx_in_clean],
@@ -1497,7 +2714,67 @@ class AScope:
                         color="magenta",
                     ),
                 )
+
+            # Annotate Noise Floor point
+            if np.any(noise_floor_mask):
+                noise_floor_label = f"noise floor\n(~{noise_floor_power:.1f} dB at {noise_floor_time:.1f} μs)"
+                ax_calib.annotate(
+                    noise_floor_label,
+                    xy=(noise_floor_time, noise_floor_power),
+                    xytext=(60, 30),
+                    textcoords="offset points",
+                    ha="left",
+                    va="bottom",
+                    fontsize=9,
+                    bbox=dict(boxstyle="round,pad=0.5", fc="white", alpha=0.7),
+                    arrowprops=dict(
+                        arrowstyle="->",
+                        connectionstyle="arc3,rad=0.3",
+                        color="orange",
+                    ),
+                )
         plt.tight_layout(pad=1.5)
+
+        # If deferring frame plots into memory, capture image instead of saving
+        if self.interactive_mode and self.defer_frame_plots:
+            try:
+                # Render figure to a high-resolution PNG buffer using montage_dpi
+                montage_dpi = self.output_config.get(
+                    "montage_dpi", self.output_config.get("plot_dpi", 150)
+                )
+                buf = io.BytesIO()
+                try:
+                    fig.savefig(buf, format="png", dpi=montage_dpi, bbox_inches="tight")
+                    buf.seek(0)
+                    from PIL import Image as PILImage
+
+                    pil_img = PILImage.open(buf).convert("RGB")
+                    img = np.array(pil_img)
+                finally:
+                    try:
+                        buf.close()
+                    except Exception:
+                        pass
+
+                if replace_index is None:
+                    self._deferred_frame_images.append(img)
+                else:
+                    # replace existing deferred image
+                    if 0 <= replace_index < len(self._deferred_frame_images):
+                        self._deferred_frame_images[replace_index] = img
+                    else:
+                        # pad list if necessary
+                        while len(self._deferred_frame_images) < replace_index:
+                            self._deferred_frame_images.append(img)
+                        self._deferred_frame_images.append(img)
+
+                print(f"Deferred combined plot for frame {frame_idx} (in-memory, dpi={montage_dpi})")
+                plt.close(fig)
+                return
+            except Exception as e:
+                print(f"Warning: could not capture deferred image: {e}")
+
+        # Default: save to disk
         plt.savefig(plot_filename, dpi=self.output_config.get("plot_dpi", 200))
         print(f"Saved combined plot: {plot_filename}")
         plt.close(fig)

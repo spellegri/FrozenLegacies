@@ -203,7 +203,7 @@ class CBDTickSelector:
 
         return refined_positions
 
-    def start_selection(self, title="Select First Two CBD Tick Marks"):
+    def start_selection(self, title="Select Six CBD Tick Marks for Maximum Accuracy"):
         """Start interactive selection with crosshair cursor."""
         height, width = self.image_full.shape
 
@@ -217,7 +217,7 @@ class CBDTickSelector:
         clean_region = self.image_full[search_start:search_end, :]
 
         # Create figure optimized for the focused view
-        self.fig, self.ax = plt.subplots(figsize=(24, 8))
+        self.fig, self.ax = plt.subplots(figsize=(15, 8))  # Match TERRA's 1.5:1 width ratio
 
         # Enhanced preprocessing specifically for tick mark visibility
         clahe = cv2.createCLAHE(clipLimit=8.0, tileGridSize=(4, 4))
@@ -326,17 +326,14 @@ class CBDTickSelector:
         if event.inaxes != self.ax:
             return
 
-        if len(self.selected_points) < 2:
+        if len(self.selected_points) < self.expected_count:
             x, y = event.xdata, event.ydata
             self.selected_points.append((int(x), int(y)))
 
-            # Improved visual markers
-            color = "red" if len(self.selected_points) == 1 else "blue"
-            label = (
-                "First CBD Tick"
-                if len(self.selected_points) == 1
-                else "Second CBD Tick"
-            )
+            # Improved visual markers - cycle through colors for any number of CBDs
+            colors = ["red", "blue", "green", "orange", "purple", "cyan", "magenta", "brown", "pink", "gray", "olive", "navy", "teal", "lime", "indigo", "coral"]
+            color = colors[(len(self.selected_points) - 1) % len(colors)]
+            label = f"CBD Tick #{len(self.selected_points)}"
 
             self.ax.plot(
                 x,
@@ -374,7 +371,7 @@ class CBDTickSelector:
                 zorder=16,
             )
 
-            if len(self.selected_points) == 2:
+            if len(self.selected_points) == self.expected_count:
                 self._calculate_all_ticks()
                 self._show_calculated_ticks()
 
@@ -382,79 +379,47 @@ class CBDTickSelector:
             self.fig.canvas.draw()
 
     def _calculate_all_ticks(self):
-        """Calculate all tick positions with local refinement."""
-        if len(self.selected_points) != 2:
+        """Use all manually selected CBD positions directly (no spacing calculation needed)."""
+        if len(self.selected_points) != self.expected_count:
+            print(f"Warning: Expected {self.expected_count} points but got {len(self.selected_points)}")
             return
 
-        x1, y1 = self.selected_points[0]
-        x2, y2 = self.selected_points[1]
+        # Sort points by x-coordinate to ensure proper order
+        sorted_points = sorted(self.selected_points, key=lambda p: p[0])
+        
+        # Use the exact manually selected positions directly
+        calculated_ticks = [int(point[0]) for point in sorted_points]
+        
+        print(f"Using {len(calculated_ticks)} manually selected CBD positions (no spacing calculation needed)")
+        print(f"Selected CBD positions: {calculated_ticks}")
 
-        # Calculate spacing
-        spacing = abs(x2 - x1)
-        start_x = min(x1, x2)
-
-        # Generate approximate positions using uniform spacing
-        approximate_ticks = []
-        for i in range(self.expected_count):
-            tick_x = start_x + i * spacing
-            if 0 <= tick_x < self.image_full.shape[1]:
-                approximate_ticks.append(int(tick_x))
-
-        # Refine positions using local image recognition
-        self.calculated_ticks = approximate_ticks
-        self.refined_ticks = self._refine_tick_positions_with_local_detection(
-            approximate_ticks
-        )
+        # Use exact calculated positions without any refinement
+        self.calculated_ticks = calculated_ticks
+        self.refined_ticks = calculated_ticks.copy()  # Same as calculated - no refinement
 
         print(
-            f"Calculated {len(self.calculated_ticks)} approximate tick positions with spacing of {spacing} pixels"
+            f"Using {len(self.calculated_ticks)} manually selected CBD tick positions"
         )
-        print(f"Approximate positions: {self.calculated_ticks}")
-        print(f"Refined positions: {self.refined_ticks}")
-
-        # Calculate refinement statistics
-        if len(self.calculated_ticks) == len(self.refined_ticks):
-            adjustments = [
-                abs(refined - approx)
-                for refined, approx in zip(self.refined_ticks, self.calculated_ticks)
-            ]
-            print(f"Average adjustment: {np.mean(adjustments):.1f} pixels")
-            print(f"Max adjustment: {np.max(adjustments):.1f} pixels")
+        print(f"CBD tick positions: {self.calculated_ticks}")
 
     def _show_calculated_ticks(self):
-        """Show both approximate and refined tick positions with improved visuals."""
-        for i, (approx_x, refined_x) in enumerate(
-            zip(self.calculated_ticks, self.refined_ticks)
-        ):
-            if i < 2:
-                continue
+        """Show the exact calculated tick positions (no refinement)."""
+        for i, tick_x in enumerate(self.calculated_ticks):
+            # Show exact calculated position - draw ALL ticks regardless of image bounds
+            self.ax.axvline(
+                x=tick_x,
+                color="green",
+                linestyle="-",
+                alpha=0.8,
+                linewidth=2,
+                zorder=13,
+            )
+            print(f"DEBUG: Drew green line {i+1} at x={tick_x}")
 
-            # Show approximate position
-            if 0 <= approx_x < self.image_full.shape[1]:
-                self.ax.axvline(
-                    x=approx_x,
-                    color="gray",
-                    linestyle="--",
-                    alpha=0.3,
-                    linewidth=1,
-                    zorder=11,
-                )
-
-            # Show refined position (green, but thinner)
-            if 0 <= refined_x < self.image_full.shape[1]:
-                self.ax.axvline(
-                    x=refined_x,
-                    color="green",
-                    linestyle="-",
-                    alpha=0.7,
-                    linewidth=1.5,
-                    zorder=13,
-                )
-
-            # Smaller tick labels
-            if i % 2 == 0:
+            # Tick labels - show labels for even indices AND the last tick
+            if i % 2 == 0 or i == len(self.calculated_ticks) - 1:
                 self.ax.text(
-                    refined_x,
+                    tick_x,
                     self.search_start + (self.search_end - self.search_start) * 0.15,
                     f"T{i + 1}",
                     ha="center",
@@ -465,17 +430,15 @@ class CBDTickSelector:
                     zorder=17,
                     bbox=dict(boxstyle="round,pad=0.2", fc="white", alpha=0.8),
                 )
+                print(f"DEBUG: Drew label T{i+1} at x={tick_x}")
+            else:
+                print(f"DEBUG: Skipped label T{i+1} (odd index)")
 
         # Update title with results
-        spacing = abs(self.selected_points[1][0] - self.selected_points[0][0])
-        avg_adjustment = np.mean(
-            [abs(r - a) for r, a in zip(self.refined_ticks, self.calculated_ticks)]
-        )
-
         self.ax.set_title(
             f"CBD Tick Mark Selection Complete \n"
-            f"{len(self.refined_ticks)} ticks: {spacing}px spacing + local refinement\n"
-            f"Gray=Approximate, Green=Refined (avg adjustment: {avg_adjustment:.1f}px)\n"
+            f"{len(self.calculated_ticks)} ticks: manually selected positions\n"
+            f"Green lines show exact selected positions\n"
             f"Yellow crosshair provides precise alignment feedback",
             fontsize=16,
             fontweight="bold",
@@ -485,8 +448,8 @@ class CBDTickSelector:
         self.fig.canvas.draw()
 
     def get_tick_positions(self):
-        """Return the refined tick positions."""
-        return self.refined_ticks if self.refined_ticks else self.calculated_ticks
+        """Return the calculated tick positions (based on manual selection without local refinement)."""
+        return self.calculated_ticks if self.calculated_ticks else []
 
     def cleanup(self):
         """Clean up event connections to prevent memory leaks."""
@@ -523,7 +486,7 @@ def manual_cbd_tick_selection(
     print(
         "This version uses uniform spacing as a guide + local image recognition for refinement."
     )
-    print("Please select the first two CBD tick marks in the clean interface.")
+    print(f"Please select all {expected_count} CBD tick marks in sequence from left to right for maximum accuracy.")
 
     selector = CBDTickSelector(
         image_full, expected_count, sprocket_removal_ratio, search_height_ratio
@@ -562,7 +525,7 @@ def validate_manual_selection_enhanced(
     if not tick_positions:
         return
 
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(24, 10))
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 10))  # Match TERRA's 1.5:1 width ratio
 
     # Show clean, focused region with detected ticks
     height, width = image_full.shape
@@ -722,7 +685,7 @@ def align_cbd_labels_with_manual_selection(
     # Get navigation data for each CBD
     cbd_data = []
     print(f"DEBUG: Looking for CBD numbers: {cbd_list}")
-    print(f"DEBUG: Available CBD numbers in nav file: {sorted(nav_df['CBD'].unique())}")
+    print(f"DEBUG: Navigation file contains {len(nav_df['CBD'].unique())} unique CBD entries")
     
     for cbd in cbd_list:
         row = nav_df[nav_df["CBD"] == cbd]
@@ -787,6 +750,8 @@ def create_time_calibrated_zscope(
     nav_path=None,
     main_output_dir=None,
     processor_ref=None,
+    calpip_y_lines=None,
+    calpip_method=None,
 ):
     plt.rcParams.update(
         {
@@ -806,7 +771,10 @@ def create_time_calibrated_zscope(
         output_params = {}
 
     output_dir_name = output_params.get("debug_output_directory", "debug_output")
-    output_dir = Path(output_dir_name)
+    if main_output_dir is not None:
+        output_dir = Path(main_output_dir) / Path(output_dir_name).name
+    else:
+        output_dir = Path(output_dir_name)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     save_dpi = output_params.get("figure_save_dpi", 600)
@@ -837,7 +805,8 @@ def create_time_calibrated_zscope(
         cv2.normalize(valid_data_crop, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
     )
 
-    fig, ax = plt.subplots(figsize=(24, 10))
+    # Match TERRA's fixed window proportions (1200x800 ratio = 1.5:1)
+    fig, ax = plt.subplots(figsize=(15, 10))  # 15:10 = 1.5:1 ratio like TERRA
 
     # Store processor reference for CBD tick storage
     if processor_ref is not None:
@@ -846,7 +815,7 @@ def create_time_calibrated_zscope(
     ax.imshow(
         enhanced_data,
         cmap=colormap,
-        aspect="auto",
+        aspect="auto",  # Keep auto but constrain figure to TERRA proportions
         extent=[0, img_width, cropped_bottom, cropped_top],
     )
 
@@ -855,7 +824,8 @@ def create_time_calibrated_zscope(
     ax.set_ylabel("")
 
     # Calibration pip and transmitter pulse overlays
-    if best_pip and "x_position" in best_pip:
+    # Only show vertical "Picked calpip" line for ARIES method
+    if best_pip and "x_position" in best_pip and calpip_method == "ARIES":
         ax.axvline(
             x=best_pip["x_position"],
             color="#DCC462",
@@ -890,51 +860,115 @@ def create_time_calibrated_zscope(
         zorder=6,
     )
 
-    # Grid lines (time)
-    total_time_range_us = (
-        cropped_bottom - transmitter_pulse_y_abs
-    ) / pixels_per_microsecond
-    min_time_us = (cropped_top - transmitter_pulse_y_abs) / pixels_per_microsecond
+    # Grid lines (time) - Use TERRA-style positioning if available, otherwise mathematical
+    # Determine calpip spacing (pixels per 2 μs) from processor if available
+    if hasattr(ax, '_processor_ref') and hasattr(ax._processor_ref, 'calpip_pixel_distance') and ax._processor_ref.calpip_pixel_distance:
+        calpip_distance = ax._processor_ref.calpip_pixel_distance  # px per 2μs
+    else:
+        # fallback: derive pixels-per-2μs from pixels_per_microsecond
+        calpip_distance = pixels_per_microsecond * 2.0
 
-    major_grid_interval_us = time_vis_params.get("major_grid_time_interval_us", 10)
-    minor_grid_interval_us = time_vis_params.get("minor_grid_time_interval_us", 2)
+    # Use provided calpip_y_lines when available; otherwise, if we have a calpip spacing
+    # from the processor (e.g., reusing calibration), synthesize a uniform grid anchored
+    # to the transmitter pulse so the visual axes remain consistent between images.
+    calpip_lines_for_display = None
+    if calpip_y_lines and len(calpip_y_lines) > 0:
+        calpip_lines_for_display = calpip_y_lines
+        is_terra_method = calpip_method == "TERRA"
+        line_color = "grey" if is_terra_method else "white"
+        method_name = "TERRA manual picks" if is_terra_method else "ARIES auto-detection"
+        print(f"Using {method_name} grid positioning with {len(calpip_lines_for_display)} lines")
+    else:
+        # No explicit calpip y-lines provided; synthesize grid if spacing available
+        calpip_lines_for_display = []
+        # Generate calpip lines below transmitter pulse at multiples of calpip_distance
+        y = transmitter_pulse_y_abs + calpip_distance
+        while y <= cropped_bottom:
+            calpip_lines_for_display.append(float(y))
+            y += calpip_distance
+        method_name = "synthesized from calpip_spacing" if len(calpip_lines_for_display) > 0 else "none"
+        line_color = "white"
+        is_terra_method = False
+        if len(calpip_lines_for_display) > 0:
+            print(f"INFO: Synthesized {len(calpip_lines_for_display)} calpip lines from spacing {calpip_distance:.2f}px")
 
-    t_us_vals = np.arange(
-        min_time_us,
-        total_time_range_us + minor_grid_interval_us,
-        minor_grid_interval_us,
-    )
+    # Single concise runtime calibration info line (safe/noisy) — useful for validation
+    try:
+        print(f"INFO: calibration: calpip_distance={calpip_distance:.3f} px/2μs, pixels_per_microsecond={pixels_per_microsecond:.6f} px/μs")
+    except Exception:
+        pass
 
-    for t_us in t_us_vals:
-        pixel_y_abs_coord = transmitter_pulse_y_abs + t_us * pixels_per_microsecond
-        if cropped_top <= pixel_y_abs_coord <= cropped_bottom:
-            is_major_grid = round(t_us, 6) % major_grid_interval_us == 0
+    # Make a working copy used for axis computations. Prefer measured spacing
+    # from visible calpip lines (below TX) when available to ensure labels match grid.
+    calpip_distance_used = calpip_distance
+    try:
+        visible_lines_all = [y for y in calpip_lines_for_display if cropped_top <= y <= cropped_bottom]
+        visible_below_tx = [y for y in visible_lines_all if y > transmitter_pulse_y_abs]
+        if len(visible_below_tx) >= 3:
+            spacings = np.diff(visible_below_tx)
+            measured_spacing = float(np.mean(spacings))
+            # Override calpip_distance_used with measured spacing to match displayed grid
+            if measured_spacing > 0:
+                print(f"INFO: Overriding calpip_distance with measured spacing {measured_spacing:.3f}px (from {len(visible_below_tx)} visible lines)")
+                calpip_distance_used = measured_spacing
+    except Exception:
+        pass
 
-            ax.axhline(
-                y=pixel_y_abs_coord,
-                color="white",
-                linestyle="-" if is_major_grid else "--",
-                alpha=0.8 if is_major_grid else 0.2,
-                linewidth=2 if is_major_grid else 1.5,
-                zorder=2,
-            )
+    # If we have calpip positions (either provided or synthesized), draw those; otherwise
+    # fall back to the original ARIES mathematical approach based on pixels_per_microsecond.
+    if calpip_lines_for_display and len(calpip_lines_for_display) > 0:
+        # Draw grid lines at the chosen calpip positions
+        for i, y_line in enumerate(calpip_lines_for_display):
+            if cropped_top <= y_line <= cropped_bottom:
+                # Calculate time (μs) using calpip_distance_used as px per 2μs
+                time_us = (y_line - transmitter_pulse_y_abs) / calpip_distance_used * 2.0
 
-            if is_major_grid:
-                ax.text(
-                    60,
-                    pixel_y_abs_coord,
-                    f"{int(round(t_us))} µs",
+                # For ARIES method or synthesized grid, use white lines with major/minor styling
+                # For TERRA manual method we intentionally skip drawing the grey grid lines.
+                if not is_terra_method:
+                    # Major grid every 10μs, minor every 2μs for ARIES
+                    is_major_grid = (abs(time_us) % 10) < 1  # Approximately every 10μs
+
+                    ax.axhline(
+                        y=y_line,
+                        color=line_color,
+                        linestyle="-" if is_major_grid else "--",
+                        alpha=0.8 if is_major_grid else 0.3,
+                        linewidth=2 if is_major_grid else 1.5,
+                        zorder=2,
+                    )
+    else:
+        # Original ARIES mathematical approach
+        total_time_range_us = (
+            cropped_bottom - transmitter_pulse_y_abs
+        ) / pixels_per_microsecond
+        min_time_us = (cropped_top - transmitter_pulse_y_abs) / pixels_per_microsecond
+
+        major_grid_interval_us = time_vis_params.get("major_grid_time_interval_us", 10)
+        minor_grid_interval_us = time_vis_params.get("minor_grid_time_interval_us", 2)
+
+        t_us_vals = np.arange(
+            min_time_us,
+            total_time_range_us + minor_grid_interval_us,
+            minor_grid_interval_us,
+        )
+
+        for t_us in t_us_vals:
+            pixel_y_abs_coord = transmitter_pulse_y_abs + t_us * pixels_per_microsecond
+            if cropped_top <= pixel_y_abs_coord <= cropped_bottom:
+                is_major_grid = round(t_us, 6) % major_grid_interval_us == 0
+
+                ax.axhline(
+                    y=pixel_y_abs_coord,
                     color="white",
-                    fontsize=12,
-                    alpha=0.9,
-                    va="center",
-                    path_effects=[
-                        path_effects.withStroke(
-                            linewidth=3, foreground="black", alpha=0.7
-                        )
-                    ],
-                    zorder=3,
+                    linestyle="-" if is_major_grid else "--",
+                    alpha=0.8 if is_major_grid else 0.2,
+                    linewidth=2 if is_major_grid else 1.5,
+                    zorder=2,
                 )
+
+                # Skip text labels on grid lines - time axis will handle labeling
+                pass
 
     # --- MANUAL CBD TICK MARK SELECTION WITH LOCAL REFINEMENT ---
     detection_method = output_params.get("cbd_detection_method", "manual")
@@ -1072,17 +1106,30 @@ def create_time_calibrated_zscope(
             epsilon_r_ice = physics_constants.get("ice_relative_permittivity_real")
             firn_corr_m = physics_constants.get("firn_correction_meters")
 
-            def abs_y_to_depth(y_abs):
+            def abs_y_to_depth_annotation(y_abs):
                 y_rel = y_abs - transmitter_pulse_y_abs
-                time_us = y_rel / pixels_per_microsecond
-                one_way_time_us = time_us / 2.0
-                return convert_time_to_depth(
-                    one_way_time_us, c0, epsilon_r_ice, firn_corr_m
-                )
+                # Use TERRA's exact methodology: depth = (y_pixel/calpip_distance) * 168
+                if hasattr(ax, '_processor_ref') and hasattr(ax._processor_ref, 'calpip_pixel_distance') and ax._processor_ref.calpip_pixel_distance:
+                    calpip_distance = ax._processor_ref.calpip_pixel_distance
+                    velocity_ice = 168.0  # m/μs - TERRA's exact velocity
+                    return (y_rel / calpip_distance) * velocity_ice
+                else:
+                    # Fallback: use two-way travel time calculation
+                    two_way_time_us = y_rel / pixels_per_microsecond
+                    velocity_ice = 168.0  # m/μs - TERRA's exact velocity
+                    return (two_way_time_us / 2) * velocity_ice
 
-            avg_surface_depth = abs_y_to_depth(avg_surface_y)
-            avg_bed_depth = abs_y_to_depth(avg_bed_y)
-            ice_thickness = avg_bed_depth - avg_surface_depth
+            avg_surface_depth = abs_y_to_depth_annotation(avg_surface_y)
+            avg_bed_depth = abs_y_to_depth_annotation(avg_bed_y)
+            
+            # TERRA's ice thickness: h_ice = (pixel_difference / calpip_distance) * 168
+            pixel_difference = avg_bed_y - avg_surface_y
+            if hasattr(ax, '_processor_ref') and hasattr(ax._processor_ref, 'calpip_pixel_distance') and ax._processor_ref.calpip_pixel_distance:
+                calpip_distance = ax._processor_ref.calpip_pixel_distance
+                ice_thickness = (pixel_difference / calpip_distance) * 168.0
+            else:
+                # Fallback: use depth difference
+                ice_thickness = avg_bed_depth - avg_surface_depth
 
             x_pos = 0.80 * img_width
 
@@ -1138,25 +1185,137 @@ def create_time_calibrated_zscope(
 
     # Depth and time axes
     def abs_y_to_depth(y_abs_coord):
+        # Explicit TERRA mapping: calpip_distance is pixels per 2μs. 2 μs -> 168 m.
         y_rel = y_abs_coord - transmitter_pulse_y_abs
-        time_us = y_rel / pixels_per_microsecond
-        one_way_time_us = time_us / 2.0
-        c0 = physics_constants.get("speed_of_light_vacuum_mps")
-        epsilon_r_ice = physics_constants.get("ice_relative_permittivity_real")
-        firn_corr_m = physics_constants.get("firn_correction_meters")
-        return convert_time_to_depth(one_way_time_us, c0, epsilon_r_ice, firn_corr_m)
+
+        # Determine calpip spacing in pixels corresponding to 2 μs
+        if hasattr(ax, '_processor_ref') and hasattr(ax._processor_ref, 'calpip_pixel_distance') and ax._processor_ref.calpip_pixel_distance:
+            calpip_distance = ax._processor_ref.calpip_pixel_distance  # px per 2μs
+        else:
+            calpip_distance = pixels_per_microsecond * 2.0  # fallback px per 2μs
+
+        velocity_ice = 168.0  # m per μs (TERRA exact)
+
+        # Depth (m) = (y_rel / calpip_distance) * velocity_ice
+        # Reason: y_rel == calpip_distance -> corresponds to 2 μs TWT -> depth = (2/2)*V = V
+        depth_m = (y_rel / calpip_distance) * velocity_ice
+        return depth_m
 
     def depth_to_abs_y(depth_m):
-        c0 = physics_constants.get("speed_of_light_vacuum_mps")
-        epsilon_r_ice = physics_constants.get("ice_relative_permittivity_real")
-        firn_corr_m = physics_constants.get("firn_correction_meters")
-        one_way_time_us = convert_depth_to_time(depth_m, c0, epsilon_r_ice, firn_corr_m)
-        two_way_time_us = one_way_time_us * 2.0
-        y_rel = two_way_time_us * pixels_per_microsecond
+        # Inverse of the explicit TERRA mapping used above.
+        velocity_ice = 168.0  # m per μs
+
+        if hasattr(ax, '_processor_ref') and hasattr(ax._processor_ref, 'calpip_pixel_distance') and ax._processor_ref.calpip_pixel_distance:
+            calpip_distance = ax._processor_ref.calpip_pixel_distance  # px per 2μs
+        else:
+            calpip_distance = pixels_per_microsecond * 2.0
+
+        # y_rel = (depth / V_ICE) * calpip_distance
+        y_rel = (depth_m / velocity_ice) * calpip_distance
         return transmitter_pulse_y_abs + y_rel
 
-    depth_ax = ax.secondary_yaxis("left", functions=(abs_y_to_depth, depth_to_abs_y))
-    depth_ax.set_ylabel("Depth Below Phase Center (m)", fontsize=16, fontweight="bold")
+    # Use the established calpip y-lines for depth axis labeling (TERRA methodology)
+    if calpip_lines_for_display and len(calpip_lines_for_display) > 0:
+        print(f"Using TERRA calpip lines for depth axis: {len(calpip_lines_for_display)} lines")
+        
+        # Filter calpip lines to only those visible in the current view
+        visible_calpip_lines = [y_line for y_line in calpip_lines_for_display 
+                      if cropped_top <= y_line <= cropped_bottom]
+
+        # For depth and time axis labeling we must only use calpip lines below the
+        # transmitter pulse (positive y_rel). This ensures depth values are
+        # positive and align with the time axis (which also only uses lines below TX).
+        visible_calpip_lines_below_tx = [y for y in visible_calpip_lines if y > transmitter_pulse_y_abs]
+
+        # Small diagnostic: print the first visible calpip mapping (below TX) so user can validate
+        try:
+            if len(visible_calpip_lines_below_tx) > 0:
+                first_y = visible_calpip_lines_below_tx[0]
+                y_rel_first = first_y - transmitter_pulse_y_abs
+                # use existing abs_y_to_depth to compute depth for the first visible line
+                first_depth = abs_y_to_depth(first_y)
+                print(
+                    f"INFO: tx_y={transmitter_pulse_y_abs:.1f}, first_calpip_y={first_y:.1f}, y_rel={y_rel_first:.1f}, calpip_distance={calpip_distance:.3f}, depth_for_first={first_depth:.1f} m"
+                )
+                # If possible, report measured spacing between visible calpip lines (below TX) vs calpip_distance
+                if len(visible_calpip_lines_below_tx) > 1:
+                    try:
+                        spacings = np.diff(visible_calpip_lines_below_tx)
+                        measured_spacing = float(np.mean(spacings))
+                        ratio = measured_spacing / float(calpip_distance) if calpip_distance != 0 else float('nan')
+                        print(f"INFO: measured_spacing={measured_spacing:.3f} px, calpip_distance={calpip_distance:.3f} px, ratio={ratio:.3f}")
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        
+        # Calculate depth values for each visible calpip line
+        depth_values = []
+        tick_positions = []
+        
+        # Determine whether measured spacing between visible calpip lines (below TX)
+        # is a better calibration than the stored `calpip_distance`. If so, use it.
+        calpip_distance_used = calpip_distance
+        try:
+            if len(visible_calpip_lines_below_tx) > 1:
+                spacings = np.diff(visible_calpip_lines_below_tx)
+                measured_spacing = float(np.mean(spacings))
+                # If measured spacing deviates from stored calibration, prefer measured
+                if calpip_distance > 0 and abs(measured_spacing / calpip_distance - 1.0) > 0.01:
+                    calpip_distance_used = measured_spacing
+                    print(f"INFO: Using measured calpip spacing {measured_spacing:.3f}px instead of stored {calpip_distance:.3f}px")
+        except Exception:
+            measured_spacing = None
+
+        # Use only calpip lines below the transmitter pulse for depth ticks
+        # Compute depth from the pixel mapping so labels reflect pixel->time mapping:
+        # depth_m = (y_rel / calpip_distance_used) * velocity_ice
+        velocity_ice = 168.0
+        for y_line in visible_calpip_lines_below_tx:
+            y_rel = y_line - transmitter_pulse_y_abs
+            try:
+                depth_m = (y_rel / float(calpip_distance_used)) * velocity_ice
+            except Exception:
+                depth_m = np.nan
+            depth_values.append(depth_m)
+            tick_positions.append(y_line)
+        
+        # Create secondary y-axis and use the calpip line positions directly
+        depth_ax = ax.secondary_yaxis("left")
+        depth_ax.set_ylabel("Depth (m)", fontsize=16, fontweight="bold")
+        
+        # Set ticks at the exact calpip line positions
+        depth_ax.set_yticks(tick_positions)
+        depth_ax.set_yticklabels([f"{int(depth)}" for depth in depth_values])
+        
+        # Set axis limits to match main axis
+        depth_ax.set_ylim(cropped_bottom, cropped_top)
+        
+        print(f"TERRA method: Placed {len(tick_positions)} depth labels at calpip line positions")
+        print(f"TERRA method: Depth range from {min(depth_values):.0f}m to {max(depth_values):.0f}m")
+        
+    else:
+        print("No calpip lines available, using mathematical grid for depth axis")
+        # Fallback to mathematical approach when no TERRA calpip lines available
+        max_depth = abs_y_to_depth(cropped_bottom)
+        min_depth = abs_y_to_depth(cropped_top)
+        
+        # Create ticks every 500m as fallback
+        start_tick = int(min_depth / 500) * 500
+        if start_tick > min_depth:
+            start_tick -= 500
+        end_tick = int(max_depth / 500 + 1) * 500
+        
+        depth_ticks = list(range(start_tick, end_tick + 1, 500))
+        visible_depth_ticks = [tick for tick in depth_ticks if min_depth - 200 <= tick <= max_depth + 200]
+        tick_y_positions = [depth_to_abs_y(tick) for tick in visible_depth_ticks]
+        
+        depth_ax = ax.secondary_yaxis("left")
+        depth_ax.set_ylabel("Depth (m)", fontsize=16, fontweight="bold")
+        depth_ax.set_yticks(tick_y_positions)
+        depth_ax.set_yticklabels([f"{int(tick)}" for tick in visible_depth_ticks])
+        depth_ax.set_ylim(cropped_bottom, cropped_top)
+    
     depth_ax.tick_params(
         axis="y",
         which="both",
@@ -1169,17 +1328,48 @@ def create_time_calibrated_zscope(
     )
     depth_ax.yaxis.label.set_color("black")
 
-    def abs_y_to_time_us(y_abs_coord):
-        return (y_abs_coord - transmitter_pulse_y_abs) / pixels_per_microsecond
+    # Create right-side time axis using the calpip lines directly
+    time_ax = ax.twinx()
+    time_ax.set_ylabel("Two-way Travel Time (μs)", fontsize=16, fontweight="bold")
+    time_ax.set_ylim(ax.get_ylim())
+    
+    # Compute time axis ticks using the calpip_distance_used so labels reflect
+    # the actual pixel→time mapping (2 μs per calpip interval).
+    time_positions = [transmitter_pulse_y_abs]
+    time_labels = ["0"]
 
-    def time_us_to_abs_y(t_us_val):
-        return (t_us_val * pixels_per_microsecond) + transmitter_pulse_y_abs
-
-    time_ax = ax.secondary_yaxis(
-        "right", functions=(abs_y_to_time_us, time_us_to_abs_y)
-    )
-    time_ax.set_ylabel("Two-way Travel Time (µs)", fontsize=16, fontweight="bold")
-    time_ax.set_ylim(cropped_bottom, cropped_top)
+    # Add only calpip lines that are BELOW the transmitter pulse (greater y-value)
+    # Compute time labels from pixel-derived mapping: time_us = (y_rel / calpip_distance_used)*2.0
+    if calpip_lines_for_display and len(calpip_lines_for_display) > 0:
+        for calpip_y in calpip_lines_for_display:
+            if calpip_y > transmitter_pulse_y_abs:  # Only lines below transmitter pulse
+                try:
+                    y_rel = calpip_y - transmitter_pulse_y_abs
+                    time_us = (y_rel / float(calpip_distance_used)) * 2.0
+                except Exception:
+                    time_us = np.nan
+                time_positions.append(calpip_y)
+                # Show whole-number μs labels only
+                if np.isfinite(time_us):
+                    time_labels.append(str(int(round(time_us))))
+                else:
+                    time_labels.append("")
+    else:
+        # Fallback: Create mathematical time grid when no calpip lines available
+        print("Creating mathematical time axis fallback (no calpip lines)")
+        # Add time markers every 2μs below transmitter pulse
+        for i in range(1, 11):  # Add up to 20μs worth of markers
+            time_us = i * 2
+            time_y = transmitter_pulse_y_abs + (time_us * pixels_per_microsecond)
+            if time_y <= cropped_bottom:  # Only if within visible area
+                time_positions.append(time_y)
+                time_labels.append(str(time_us))
+    
+    # Set the time axis ticks and labels
+    time_ax.set_yticks(time_positions)
+    time_ax.set_yticklabels(time_labels)
+    
+    # Style the time axis
     time_ax.tick_params(
         axis="y",
         which="both",
@@ -1189,10 +1379,14 @@ def create_time_calibrated_zscope(
         length=8,
         width=2,
         labelsize=14,
+        right=True,
+        labelright=True
     )
     time_ax.yaxis.label.set_color("black")
+    time_ax.yaxis.set_label_position('right')
 
-    plt.subplots_adjust(left=0.12, right=0.88, bottom=0.10, top=0.95)
+    # Adjust layout to accommodate both y-axes
+    plt.subplots_adjust(left=0.12, right=0.85, bottom=0.10, top=0.95)
 
     ax.set_title(
         f"Picked Z-scope: {base_filename}",

@@ -124,6 +124,10 @@ python main.py --input path/to/image.tiff --interactive frame_number
 python main.py --input data/103/F103-C0467_0479.tiff --interactive 4
 ```
 
+### Calibrated-only Montage (new)
+
+When using Step 4 (trace review) interactively there's now a "Calibrated Plots (no picks)" button. This opens a second montage showing calibrated power vs time plots without surface/bed picks — useful when you want to visually inspect the calibrated A-scope frames and then edit `config/default_config.json` to set absolute time windows for surface/bed selection. After editing the config, return to the trace review and re-run Step 4 to evaluate your new config.
+
 ### Command Line Options
 
 - `--input`: Single TIFF image file path
@@ -176,6 +180,8 @@ Key configuration sections:
     "tx_min_separation_us": 0.1,          // Min separation for double pulse
     "tx_max_separation_us": 3.5,          // Max separation for double pulse
     "tx_power_diff_threshold_db": 8.0     // Power difference threshold
+    "tx_search_start_us": null,           // Optional absolute search start (μs) - primary if set
+    "tx_search_end_us": null,             // Optional absolute search end (μs) - primary if set
 }
 ```
 
@@ -192,6 +198,8 @@ Key configuration sections:
     "surface_min_snr_db": 10.0,               // Minimum signal-to-noise ratio
     "surface_search_start_offset_px": 20,     // Pixel offset from TX pulse
     "surface_peak_distance_px": 15            // Minimum distance between peaks
+    "surface_search_start_us": null,         // Optional absolute surface search start (μs)
+    "surface_search_end_us": null,           // Optional absolute surface search end (μs)
 }
 ```
 
@@ -212,8 +220,64 @@ Key configuration sections:
     "bed_min_power_db": -45,                  // Minimum detectable power
     "bed_peak_prominence_db": 0.1,            // Peak prominence threshold
     "bed_relative_fallback_db_drop": 25       // Fallback threshold
+    "bed_search_start_us": null,             // Optional absolute bed search start (μs)
+    "bed_search_end_us": null,               // Optional absolute bed search end (μs)
+    "bed_select_mode": "highest_peak",    // How to choose a bed candidate inside absolute window: "highest_peak", "highest_power" (raw max), or "most_prominent"
 }
 ```
+
+Note: If any of the *_search_start_us / *_search_end_us keys are set, URSA will use the specified calibrated time window (μs) as the primary method to locate the highest-power peak for the corresponding feature (TX, Surface, Bed). If no valid candidate is found inside that absolute window (or the keys are unset), URSA falls back to the original relative/heuristic search logic (offsets, decay detection, and pixel-based searches).
+
+Important: When an absolute window is set for Surface or Bed, URSA will choose the highest local peak inside that window as the primary pick and will ignore configured minimum-power checks (e.g. `surface_min_snr_db` or `bed_min_power_db`) for that absolute-window selection. This makes absolute windows deterministic and robust to thresholding — but also means the window must be chosen carefully to avoid false positives.
+
+### 🔎 How URSA chooses the "primary" peak (absolute window vs automatic)
+
+You can control how URSA selects the primary peak for the transmitter (TX), surface and bed echoes in two ways:
+
+- 1) By specifying an absolute time window in the configuration file (recommended when you know roughly where the echo should be). When any of these *_search_start_us / *_search_end_us keys are set, URSA will use that absolute window as the PRIMARY selection mechanism and will pick the single highest local peak inside the window.
+- 2) If an absolute window is not set, or if URSA finds no valid peaks inside a user-specified window, URSA falls back to the automatic (heuristic) search algorithm. The automatic algorithm uses relative offsets from the detected TX pulse, SNR thresholds, geometric-loss compensation and peak prominence checks.
+
+When an absolute window is used (absolute-window selection):
+- URSA will pick the highest local peak inside the window, ignoring configurable minimum-power checks and some relative-time safeguards (this behavior makes an absolute window deterministic, but it can also select false positives if the window is too wide or misplaced).
+
+When the absolute-window selection fails (no valid peak inside the window):
+- URSA will fall back to the automatic heuristic logic to search based on offsets, SNR, pixel-based trimming and geometric loss handling. This is the original behavior when absolute windows are not provided.
+
+### ⚙️ Config keys you can change
+
+Here are the specific keys in `config/default_config.json` that control absolute-window behavior and related thresholds:
+
+- Transmitter (TX) selection:
+  - `tx_search_start_us` — optional absolute start time (μs) for TX search
+  - `tx_search_end_us` — optional absolute end time (μs) for TX search
+  - `tx_min_separation_us`, `tx_max_separation_us` — used by automatic double-pulse detection
+  - `tx_power_diff_threshold_db` — threshold for double-pulse power difference
+
+- Surface selection:
+  - `surface_search_start_us` — optional absolute start time (μs) for surface search (primary if set)
+  - `surface_search_end_us` — optional absolute end time (μs) for surface search
+  - `surface_min_snr_db` — when using automatic detection, minimum SNR threshold for accepting a surface candidate
+  - `surface_search_start_offset_us`, `surface_search_window_us` — offset-based window used by automatic detection when no absolute window is set
+
+- Bed selection:
+  - `bed_search_start_us` — optional absolute start time (μs) for bed search (primary if set)
+  - `bed_search_end_us` — optional absolute end time (μs) for bed search
+  - `bed_select_mode` — controls which candidate wins inside an absolute window. Valid values:
+      - `highest_peak` (default): selects the peak with the highest prominence within the window
+      - `highest_power`: selects the highest raw-power sample inside the window
+      - `most_prominent`: selects by peak prominence (shape-based)
+  - `bed_min_time_after_surface_us` — minimum time separation required by automatic detection when NOT using absolute windows
+  - `bed_min_power_db` — minimum power threshold used by automatic detection
+
+### Practical guidance
+
+- If you already know roughly where surface/bed echoes should lie, set `surface_search_start_us`/`surface_search_end_us` and/or `bed_search_start_us`/`bed_search_end_us` to narrow windows. URSA will choose the single highest peak inside those windows, which can help make results deterministic across datasets.
+- Use `bed_select_mode` to influence how an absolute-window bed pick is chosen — `highest_power` tends to bias towards strong, narrow peaks while `most_prominent` prefers wider, well-shaped returns.
+- If your window contains noisy or spurious peaks, make it narrower rather than relying on thresholds; absolute-window selection ignores some threshold checks.
+
+#### Fallback behavior
+
+If a user-specified window fails (no peak found inside), URSA will automatically attempt the regular heuristic (offset + SNR + prominence) search — so you can safely supply windows as hints without risking total failure.
 
 **Quick Adjustments**:
 - **Bed too close to surface**: Increase `bed_min_time_after_surface_us` to 3-4

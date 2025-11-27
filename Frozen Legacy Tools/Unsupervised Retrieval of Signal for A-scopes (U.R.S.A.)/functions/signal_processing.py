@@ -67,8 +67,17 @@ def detect_signal_in_frame(frame, config):
     return np.array(signal_x), signal_y_smooth
 
 
-def trim_signal_trace(frame_img, signal_x, signal_y, config):
-    """Trims ends of the signal trace and keeps the longest valid run."""
+def trim_signal_trace(frame_img, signal_x, signal_y, config, is_edge_ascope=False, edge_ascope_position=None):
+    """Trims ends of the signal trace and keeps the longest valid run.
+    
+    Args:
+        frame_img: Frame image array
+        signal_x: X coordinates of signal trace
+        signal_y: Y coordinates of signal trace
+        config: Configuration dictionary
+        is_edge_ascope: Boolean indicating if this is the first or last A-scope frame
+        edge_ascope_position: 'first' or 'last' to specify which edge frame this is
+    """
     if signal_x is None or len(signal_x) == 0:
         return np.array([]), np.array([])
 
@@ -81,16 +90,35 @@ def trim_signal_trace(frame_img, signal_x, signal_y, config):
 
     min_run_frac = processing_params.get("signal_trim_min_run_frac", 0.4)
     trim_frac = processing_params.get("signal_trim_frac", 0.17)
+    
+    # For edge A-scopes (first and last), apply specific trimming per edge
+    edge_trim_enabled = processing_params.get("signal_trim_edge_ascope_enabled", True)
+    
+    # Get left and right trim fractions based on frame position
+    if is_edge_ascope and edge_ascope_position == 'first' and edge_trim_enabled:
+        left_trim_frac = processing_params.get("signal_trim_first_ascope_left_frac", 0.25)
+        right_trim_frac = processing_params.get("signal_trim_first_ascope_right_frac", 0.18)
+        print(f"INFO: First A-scope edge frame - Left trim: {left_trim_frac}, Right trim: {right_trim_frac}")
+    elif is_edge_ascope and edge_ascope_position == 'last' and edge_trim_enabled:
+        left_trim_frac = processing_params.get("signal_trim_last_ascope_left_frac", 0.18)
+        right_trim_frac = processing_params.get("signal_trim_last_ascope_right_frac", 0.25)
+        print(f"INFO: Last A-scope edge frame - Left trim: {left_trim_frac}, Right trim: {right_trim_frac}")
+    else:
+        # Standard symmetric trimming for non-edge frames
+        left_trim_frac = trim_frac
+        right_trim_frac = trim_frac
+
+    left_trim_px = int(w * left_trim_frac)   # Pixels to trim from left end
+    right_trim_px = int(w * right_trim_frac)  # Pixels to trim from right end
 
     min_run = int(w * min_run_frac)  # Min length relative to frame width
-    trim_px = int(w * trim_frac)  # Pixels to trim from each end
 
-    if len(x) < trim_px * 2 + min_run:
+    if len(x) < left_trim_px + right_trim_px + min_run:
         print("Warning: Signal too short to trim effectively.")
         return x, y  # Return untrimmed if too short
 
-    # Initial trim based on pixel distance from ends
-    mask = (x >= trim_px) & (x <= (x.max() - trim_px))
+    # Initial trim based on pixel distance from ends (asymmetric for edge frames)
+    mask = (x >= left_trim_px) & (x <= (x.max() - right_trim_px))
     if not np.any(mask):
         print("Warning: Initial trimming removed all signal points.")
         return np.array([]), np.array([])

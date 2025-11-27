@@ -34,6 +34,36 @@ from functions.interactive_tools import ClickSelector
 from zscope_processor import ZScopeProcessor
 
 
+def ask_calpip_method():
+    """Ask user to choose between ARIES and TERRA calpip detection methods"""
+    import tkinter as tk
+    from tkinter import messagebox
+    
+    # Create a simple dialog window
+    root = tk.Tk()
+    root.withdraw()  # Hide the main window
+    
+    # Ask user for method choice
+    choice = messagebox.askyesno(
+        "Calpip Detection Method",
+        "Choose calibration method:\n\n"
+        "YES = ARIES Method (Automatic detection)\n"
+        "   • Automatically finds calpip lines\n"
+        "   • Requires initial area selection\n"
+        "   • Fast and consistent\n\n"
+        "NO = TERRA Method (Manual selection)\n"
+        "   • Manually click on 4 calpip lines\n"
+        "   • Full windowed interface with slider\n"
+        "   • Same method as TERRA system\n"
+        "   • Each line = 2.0 microseconds\n\n"
+        "Click YES for ARIES method or NO for TERRA method"
+    )
+    
+    root.destroy()
+    
+    return "ARIES" if choice else "TERRA"
+
+
 def export_enhanced_csv_for_image(processor, output_dir, nav_df=None):
     """
     Export enhanced CSV for a single processed image.
@@ -142,22 +172,10 @@ def process_flight_batch(
                 )
                 return
             if user_input == "y":
-                temp_image = load_and_preprocess_image(
-                    tiff_path, processor.config.get("preprocessing_params", {})
-                )
-                if temp_image is None:
-                    print(
-                        f"ERROR: Could not load image {tiff_path} for calpip selection."
-                    )
-                    continue
-                selector_title = f"Select calpip for: {file_name}"
-                selector = ClickSelector(temp_image, title=selector_title)
-                last_x_pip = selector.selected_x
-                if last_x_pip is None:
-                    print("No calpip selected. Skipping this file.")
-                    break
-                else:
-                    break
+                # For new calpip selection, we'll let the processor handle the method choice
+                # Set last_x_pip to None to trigger new calpip selection in processor
+                last_x_pip = None
+                break
             elif user_input == "n":
                 if last_x_pip is None:
                     print("No previous calpip available. Please select one.")
@@ -167,11 +185,28 @@ def process_flight_batch(
             else:
                 print("Invalid input. Please enter 'y', 'n', or 'q'.")
 
-        if last_x_pip is not None:
+        # Handle both new selection (last_x_pip=None) and reuse cases
+        if user_input != "q":  # Process unless user quit
+            # Determine if we're reusing calibration data
+            reuse_calibration = (user_input == "n")
+            
+            # For new selection (user_input == "y"), last_x_pip will be None
+            # The processor will handle calpip method selection internally
+            if last_x_pip is None and user_input == "y":
+                print(f"INFO: New calpip selection requested for {file_name}")
+                # Use a default X position, processor will handle the actual selection
+                approx_x_for_selection = 19000  # Default middle position
+            else:
+                approx_x_for_selection = last_x_pip
+            
             # Process the image
             processing_success = processor.process_image(
-                tiff_path, output_dir, last_x_pip, nav_df=nav_df, nav_path=nav_path
+                tiff_path, output_dir, approx_x_for_selection, nav_df=nav_df, nav_path=nav_path, reuse_calibration=reuse_calibration
             )
+            
+            # Update last_x_pip after processing for potential reuse
+            if processing_success and hasattr(processor, 'last_approx_x_pip'):
+                last_x_pip = processor.last_approx_x_pip
 
             if processing_success:
                 # Export enhanced CSV
@@ -209,17 +244,16 @@ def run_processing():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
+        "--output",
+        type=str,
+        default="output",
+        help="Directory where all output files (plots, data) will be saved.",
+    )
+    parser.add_argument(
         "image_path",
         type=str,
         nargs="?",
-        help="Path to the Z-scope image file (e.g., .tif, .png, .jpg).",
-    )
-    parser.add_argument(
-        "output_dir",
-        type=str,
-        nargs="?",
-        default="output",
-        help="Directory where all output files (plots, data) will be saved.",
+        help="Path to the Z-scope image file (e.g., .tif, .png, .jpg). Not used in batch mode.",
     )
     parser.add_argument(
         "--config",
@@ -247,7 +281,7 @@ def run_processing():
         help="If set, process all .tiff files in this directory sequentially (batch mode).",
     )
     parser.add_argument(
-        "--nav_file",
+        "--nav",
         type=str,
         default=None,
         help="Path to merged navigation CSV (e.g., merged_103_nav.csv) for coordinate interpolation.",
@@ -256,11 +290,17 @@ def run_processing():
     args = parser.parse_args()
 
     SCRIPT_DIR = Path(__file__).resolve().parent
-    output_path_obj = Path(args.output_dir)
-    if not output_path_obj.is_absolute():
-        final_output_dir = SCRIPT_DIR / output_path_obj
-    else:
-        final_output_dir = output_path_obj
+    output_path_obj = Path(args.output)
+    
+    # Debug output path resolution
+    print(f"DEBUG: args.output = '{args.output}'")
+    print(f"DEBUG: output_path_obj = {output_path_obj}")
+    print(f"DEBUG: output_path_obj.is_absolute() = {output_path_obj.is_absolute()}")
+    
+    # Always use the provided path as-is (absolute or relative to current working directory)
+    final_output_dir = output_path_obj.resolve()
+    
+    print(f"DEBUG: final_output_dir.resolve() = {final_output_dir.resolve()}")
 
     final_output_dir.mkdir(parents=True, exist_ok=True)
     print(f"INFO: Output will be saved to: {final_output_dir.resolve()}")
@@ -272,47 +312,60 @@ def run_processing():
         sys.exit(1)
 
     # --- Batch Mode Logic ---
-    if args.batch_dir is not None and args.nav_file is not None:
+    if args.batch_dir is not None and args.nav is not None:
         print(f"\nINFO: Starting batch processing for directory: {args.batch_dir}")
         print(f"INFO: Enhanced CSV export will be performed for each image")
         approx_x_pip_selected = args.non_interactive_pip_x
 
         if approx_x_pip_selected is None:
-            tiff_files = sorted(glob.glob(str(Path(args.batch_dir) / "*.tiff")))
-            if not tiff_files:
-                print(f"ERROR: No .tiff files found in {args.batch_dir}")
-                sys.exit(1)
+            # Ask user for method choice first
+            method_choice = ask_calpip_method()
+            
+            if method_choice == "TERRA":
+                # For TERRA method, we don't need initial area selection
+                print("\nINFO: Using TERRA manual calpip selection method")
+                print("INFO: TERRA method will open with full navigation - no initial area selection needed")
+                approx_x_pip_selected = 0  # Dummy value, won't be used by TERRA method
+            else:
+                # For ARIES method, we need the initial area selection
+                tiff_files = sorted(glob.glob(str(Path(args.batch_dir) / "*.tiff")))
+                if not tiff_files:
+                    print(f"ERROR: No .tiff files found in {args.batch_dir}")
+                    sys.exit(1)
 
-            first_image_path = tiff_files[0]
-            print(
-                "\nINFO: Preparing for interactive calibration pip selection (batch mode, first file)..."
-            )
-            temp_image_for_selector = load_and_preprocess_image(
-                first_image_path, processor.config.get("preprocessing_params", {})
-            )
-            if temp_image_for_selector is None:
+                first_image_path = tiff_files[0]
                 print(
-                    f"ERROR: Failed to load image '{first_image_path}' for pip selection. Exiting."
+                    "\nINFO: Preparing for interactive calibration pip selection (ARIES method)..."
                 )
-                sys.exit(1)
+                temp_image_for_selector = load_and_preprocess_image(
+                    first_image_path, processor.config.get("preprocessing_params", {})
+                )
+                if temp_image_for_selector is None:
+                    print(
+                        f"ERROR: Failed to load image '{first_image_path}' for pip selection. Exiting."
+                    )
+                    sys.exit(1)
 
-            print(
-                "INFO: Please click on the approximate vertical location of the calibration pip ticks in the displayed image."
-            )
-            file_name = Path(first_image_path).name
-            selector_title = f"Select calpip for: {file_name}"
-            selector = ClickSelector(temp_image_for_selector, title=selector_title)
-            approx_x_pip_selected = selector.selected_x
-
-            if approx_x_pip_selected is None:
                 print(
-                    "ERROR: No location selected for calibration pip via ClickSelector. Exiting."
+                    "INFO: Please click on the approximate vertical location of the calibration pip ticks in the displayed image."
                 )
-                sys.exit(1)
+                file_name = Path(first_image_path).name
+                selector_title = f"Select calpip area for: {file_name}"
+                selector = ClickSelector(temp_image_for_selector, title=selector_title)
+                approx_x_pip_selected = selector.selected_x
 
-            print(
-                f"INFO: User selected approximate X-coordinate for calibration pip: {approx_x_pip_selected}"
-            )
+                if approx_x_pip_selected is None:
+                    print(
+                        "ERROR: No location selected for calibration pip via ClickSelector. Exiting."
+                    )
+                    sys.exit(1)
+
+                print(
+                    f"INFO: User selected approximate X-coordinate for calibration pip: {approx_x_pip_selected}"
+                )
+            
+            # Store the method choice for later use
+            processor.calpip_method_choice = method_choice
         else:
             print(
                 f"INFO: Using non-interactive X-coordinate for calibration pip: {approx_x_pip_selected}"
@@ -322,7 +375,7 @@ def run_processing():
             args.batch_dir,
             str(final_output_dir.resolve()),
             processor,
-            args.nav_file,
+            args.nav,
             approx_x_pip_selected,
         )
         print("\nINFO: Batch processing completed.")
@@ -384,9 +437,9 @@ def run_processing():
 
     # Load navigation data for enhanced CSV export
     nav_df = None
-    if args.nav_file and Path(args.nav_file).exists():
+    if args.nav and Path(args.nav).exists():
         try:
-            nav_df = pd.read_csv(args.nav_file)
+            nav_df = pd.read_csv(args.nav)
             print(f"INFO: Loaded navigation data with {len(nav_df)} records")
         except Exception as e:
             print(f"WARNING: Could not load navigation file: {e}")
@@ -423,6 +476,50 @@ def run_processing():
             surface_plot_params = echo_plot_config.get("surface_detection", {})
             bed_plot_params = echo_plot_config.get("bed_detection", {})
 
+            # Add transmitter pulse line for reference
+            if processor.transmitter_pulse_y_abs is not None:
+                tx_pulse_cropped = processor.transmitter_pulse_y_abs - processor.data_top_abs
+                processor.calibrated_ax.axhline(
+                    y=tx_pulse_cropped,
+                    color="#0072B2",
+                    linestyle="-",
+                    linewidth=2,
+                    alpha=0.8,
+                    label="Transmitter Pulse (0 µs)",
+                )
+                print("INFO: Added transmitter pulse reference line.")
+
+            # Add search window annotations for parameter tuning help
+            surface_params = echo_plot_config.get("surface_detection", {})
+            bed_params = echo_plot_config.get("bed_detection", {})
+            
+            if processor.transmitter_pulse_y_abs is not None:
+                # Surface search window
+                surface_start_offset = surface_params.get("search_start_offset_px", 355)
+                surface_depth = surface_params.get("search_depth_px", 150)
+                surface_search_start = processor.transmitter_pulse_y_abs + surface_start_offset - processor.data_top_abs
+                surface_search_end = surface_search_start + surface_depth
+                
+                processor.calibrated_ax.axhspan(
+                    surface_search_start, surface_search_end,
+                    alpha=0.1, color="cyan", label=f"Surface Search Window ({surface_start_offset}+{surface_depth}px)"
+                )
+                
+                # Bed search window (if surface is detected)
+                if processor.detected_surface_y_abs is not None and np.any(np.isfinite(processor.detected_surface_y_abs)):
+                    bed_start_offset = bed_params.get("search_start_offset_from_surface_px", 495)
+                    bed_end_offset = bed_params.get("search_end_offset_from_z_boundary_px", 22)
+                    
+                    # Use mean surface position for visualization
+                    mean_surface_y = np.nanmean(processor.detected_surface_y_abs)
+                    bed_search_start = mean_surface_y + bed_start_offset - processor.data_top_abs
+                    bed_search_end = (processor.data_bottom_abs - bed_end_offset) - processor.data_top_abs
+                    
+                    processor.calibrated_ax.axhspan(
+                        bed_search_start, bed_search_end,
+                        alpha=0.1, color="orange", label=f"Bed Search Window ({bed_start_offset}px from surface)"
+                    )
+
             if processor.detected_surface_y_abs is not None and np.any(
                 np.isfinite(processor.detected_surface_y_abs)
             ):
@@ -436,7 +533,7 @@ def run_processing():
                         surface_y_cropped[valid_indices],
                         color=surface_plot_params.get("plot_color", "cyan"),
                         linestyle=surface_plot_params.get("plot_linestyle", "-"),
-                        linewidth=1.5,
+                        linewidth=2,
                         label="Auto Surface Echo",
                     )
                     print("INFO: Plotted automatically detected surface echo.")
@@ -454,12 +551,23 @@ def run_processing():
                         bed_y_cropped[valid_indices],
                         color=bed_plot_params.get("plot_color", "lime"),
                         linestyle=bed_plot_params.get("plot_linestyle", "-"),
-                        linewidth=1.5,
+                        linewidth=2,
                         label="Auto Bed Echo",
                     )
                     print("INFO: Plotted automatically detected bed echo.")
                 else:
                     print("INFO: No valid automatic bed echo trace to plot.")
+
+            # Add helpful Y-axis information and title
+            processor.calibrated_ax.set_ylabel("Pixels from Top of Data Region", fontsize=12)
+            
+            # Add configuration info to title
+            surface_offset = surface_params.get("search_start_offset_px", 355)
+            bed_offset = bed_params.get("search_start_offset_from_surface_px", 495)
+            
+            current_title = processor.calibrated_ax.get_title()
+            enhanced_title = f"{current_title}\nSearch Offsets: Surface={surface_offset}px from TX, Bed={bed_offset}px from Surface"
+            processor.calibrated_ax.set_title(enhanced_title, fontsize=14)
 
             time_vis_params = processor.config.get(
                 "time_calibration_visualization_params", {}
@@ -467,6 +575,7 @@ def run_processing():
             processor.calibrated_ax.legend(
                 loc=time_vis_params.get("legend_location", "upper right"),
                 fontsize="small",
+                framealpha=0.9,
             )
 
             auto_echo_plot_filename = (

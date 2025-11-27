@@ -18,8 +18,19 @@ def detect_double_transmitter_pulse(
     if time_vals is None or power_vals is None:
         return {"is_double_pulse": False, "recommended_tx_idx": None, "confidence": 0.0}
 
-    # Focus on early time window (first 4 microseconds for TX detection)
-    early_time_mask = time_vals <= 4.0
+    # Prefer user-configured absolute TX search window (microseconds) when available
+    processing_params = config.get("processing_params", {})
+    tx_start = processing_params.get("tx_search_start_us")
+    tx_end = processing_params.get("tx_search_end_us")
+
+    if tx_start is not None and tx_end is not None:
+        time_mask = (time_vals >= tx_start) & (time_vals <= tx_end)
+        print(f"INFO: Using configured TX search window {tx_start}-{tx_end} μs for TX detection")
+    else:
+        # Focus on early time window (default first 4 microseconds for TX detection)
+        time_mask = time_vals <= 4.0
+
+    early_time_mask = time_mask
     early_times = time_vals[early_time_mask]
     early_powers = power_vals[early_time_mask]
 
@@ -59,7 +70,29 @@ def detect_double_transmitter_pulse(
     # Initialize peak_powers here to avoid UnboundLocalError
     if len(peaks) == 0:
         print("WARNING: No TX peaks found in early time window")
-        return result
+        # If no peaks found in configured (or default) tx window, fall back to trying a slightly
+        # larger early-time region (safety) before giving up. This preserves previous behavior.
+        fallback_mask = time_vals <= 6.0
+        if not np.any(fallback_mask):
+            return result
+        fallback_times = time_vals[fallback_mask]
+        fallback_powers = power_vals[fallback_mask]
+        peaks_fb, props_fb = find_peaks(
+            fallback_powers,
+            height=np.median(power_vals) + 10.0,
+            distance=max(1, int(0.3 / (time_vals[1] - time_vals[0]))),
+            prominence=3.0,
+            width=2,
+        )
+
+        if len(peaks_fb) == 0:
+            return result
+
+        # Use fallback peaks as our peaks for further analysis
+        peaks = peaks_fb
+        properties = props_fb
+        early_times = fallback_times
+        early_powers = fallback_powers
 
     # Now we know peaks has elements, so we can safely use it
     peak_times = early_times[peaks]
@@ -135,11 +168,18 @@ def detect_surface_echo_adaptive(power_vals, time_vals, tx_analysis, config):
         surface_window = processing_params.get("surface_search_window_us", 6.0)
         tx_end_time = tx_time + surface_start_offset
 
-    # Define surface search window using config parameters
-    surface_start_time = tx_end_time
-    surface_end_time = surface_start_time + surface_window
+    # If user provided an absolute surface search window, use that first (primary method)
+    surface_start_abs = processing_params.get("surface_search_start_us")
+    surface_end_abs = processing_params.get("surface_search_end_us")
 
-    surface_mask = (time_vals >= surface_start_time) & (time_vals <= surface_end_time)
+    if surface_start_abs is not None and surface_end_abs is not None:
+        print(f"INFO: Using configured surface search window {surface_start_abs}-{surface_end_abs} μs")
+        surface_mask = (time_vals >= surface_start_abs) & (time_vals <= surface_end_abs)
+    else:
+        # Define surface search window using config parameters (relative to TX)
+        surface_start_time = tx_end_time
+        surface_end_time = surface_start_time + surface_window
+        surface_mask = (time_vals >= surface_start_time) & (time_vals <= surface_end_time)
     if not np.any(surface_mask):
         return None
 
@@ -148,10 +188,29 @@ def detect_surface_echo_adaptive(power_vals, time_vals, tx_analysis, config):
     surface_indices = np.where(surface_mask)[0]
 
     # Enhanced surface detection using multiple criteria
-    noise_floor = np.median(power_vals[-50:])  # Estimate noise from end
+    # Calculate noise floor from 5-6.2 μs window (post-TX, pre-surface region)
+    noise_floor_start_time = processing_params.get("noise_floor_window_start_us", 5.0)
+    noise_floor_end_time = processing_params.get("noise_floor_window_end_us", 6.2)
+    
+    noise_floor_mask = (time_vals >= noise_floor_start_time) & (time_vals <= noise_floor_end_time)
+    if np.any(noise_floor_mask):
+        noise_floor_region = power_vals[noise_floor_mask]
+        noise_floor = np.min(noise_floor_region)  # Lowest point in noise window
+        min_idx_in_window = np.argmin(noise_floor_region)
+        min_time_in_window = time_vals[noise_floor_mask][min_idx_in_window]
+        print(
+            f"INFO: Noise floor from 5.0-6.2 μs window: {noise_floor:.2f} dB at {min_time_in_window:.2f} μs"
+        )
+    else:
+        # Fallback to end-of-signal noise estimate if 5-6.2 window not available
+        noise_floor = np.median(power_vals[-50:])
+        print(
+            f"WARNING: Could not access 5.0-6.2 μs window for noise floor. Using end-of-signal estimate: {noise_floor:.2f} dB"
+        )
+    
     signal_std = np.std(power_vals[-50:])
 
-    # Method 1: Look for highest power peak (surface usually strongest after TX)
+    # Method 1: If user specified an absolute window, prefer the single highest-power peak
     max_power_idx = np.argmax(surface_powers)
     max_power_candidate = surface_indices[max_power_idx]
 
@@ -162,18 +221,41 @@ def detect_surface_echo_adaptive(power_vals, time_vals, tx_analysis, config):
 
     from scipy.signal import find_peaks
 
-    peaks, properties = find_peaks(
-        surface_powers,
-        height=surface_threshold,
-        distance=int(0.2 / (time_vals[1] - time_vals[0])),  # Min 0.2μs separation
-        prominence=max(processing_params.get("surface_peak_prominence_noise_std", 2.0), processing_params.get("surface_peak_prominence_noise_std", 2.0) * signal_std),
-        width=1,
-    )
+    # If absolute window is set, prefer the highest local peak inside that exact window
+    # (ignore the configured min-power threshold — user requested selecting the highest peak).
+    if surface_start_abs is not None and surface_end_abs is not None:
+        # Find local maxima (peaks) without requiring a minimum height, then pick the highest
+        peaks, properties = find_peaks(
+            surface_powers,
+            distance=max(1, int(0.2 / (time_vals[1] - time_vals[0]))),
+        )
+        # If find_peaks finds nothing, we will fall back to the raw maximum sample in window
+    else:
+        peaks, properties = find_peaks(
+            surface_powers,
+            height=surface_threshold,
+            distance=int(0.2 / (time_vals[1] - time_vals[0])),  # Min 0.2μs separation
+            prominence=max(processing_params.get("surface_peak_prominence_noise_std", 2.0), processing_params.get("surface_peak_prominence_noise_std", 2.0) * signal_std),
+            width=1,
+        )
 
     candidates = []
 
-    # Add maximum power candidate
-    if surface_powers[max_power_idx] >= surface_threshold:
+    # For absolute surface window: prefer peak-derived candidates. If peaks were
+    # found inside the absolute window, add *only* those peaks as candidates and
+    # select the highest-power peak later; if no peaks found, fall back to raw max.
+    if surface_start_abs is not None and surface_end_abs is not None:
+        if len(peaks) == 0:
+            # No peaks found -> include raw maximum sample as candidate
+            candidates.append(
+                {
+                    "idx": max_power_candidate,
+                    "power": surface_powers[max_power_idx],
+                    "time": surface_times[max_power_idx],
+                    "score": surface_powers[max_power_idx] - noise_floor,
+                }
+            )
+    elif surface_powers[max_power_idx] >= surface_threshold:
         candidates.append(
             {
                 "idx": max_power_candidate,
@@ -197,7 +279,61 @@ def detect_surface_echo_adaptive(power_vals, time_vals, tx_analysis, config):
 
     if not candidates:
         print("WARNING: No surface candidates found above threshold")
-        return None
+        # If using an absolute surface search window and it failed thresholds, fallback to original
+        if surface_start_abs is not None and surface_end_abs is not None:
+            # Fall back: run original relative-time based surface search
+            print("INFO: Absolute surface search failed thresholds, falling back to relative TX-based search")
+            # Prepare a fallback masked region relative to TX using previous method
+            surface_start_time = tx_end_time
+            surface_end_time = surface_start_time + surface_window
+            surface_mask = (time_vals >= surface_start_time) & (time_vals <= surface_end_time)
+            if not np.any(surface_mask):
+                print("WARNING: Fallback relative TX-based surface region is empty, giving up")
+                return None
+
+            surface_times = time_vals[surface_mask]
+            surface_powers = power_vals[surface_mask]
+            surface_indices = np.where(surface_mask)[0]
+
+            peaks, properties = find_peaks(
+                surface_powers,
+                height=surface_threshold,
+                distance=int(0.2 / (time_vals[1] - time_vals[0])),
+                prominence=max(processing_params.get("surface_peak_prominence_noise_std", 2.0), processing_params.get("surface_peak_prominence_noise_std", 2.0) * signal_std),
+                width=1,
+            )
+
+            # If no peaks found in the fallback run, try a softer detection option (single maximum sample)
+            if len(peaks) == 0:
+                print("INFO: No peaks found in fallback TX-based window; trying raw max sample in fallback window")
+                max_power_idx = np.argmax(surface_powers)
+                max_power_candidate = surface_indices[max_power_idx]
+                if surface_powers[max_power_idx] >= surface_threshold * 0.5:  # relaxed check
+                    candidates.append(
+                        {
+                            "idx": max_power_candidate,
+                            "power": surface_powers[max_power_idx],
+                            "time": surface_times[max_power_idx],
+                            "score": surface_powers[max_power_idx] - noise_floor,
+                        }
+                    )
+                else:
+                    print("WARNING: Fallback raw max still below relaxed threshold; no surface found")
+                    return None
+            else:
+                # Convert peaks discovered in fallback into candidate entries
+                for peak_idx in peaks:
+                    global_idx = surface_indices[peak_idx]
+                    candidates.append(
+                        {
+                            "idx": global_idx,
+                            "power": surface_powers[peak_idx],
+                            "time": surface_times[peak_idx],
+                            "score": surface_powers[peak_idx] - noise_floor,
+                        }
+                    )
+        else:
+            return None
 
     # Remove duplicates and sort by score (power above noise)
     unique_candidates = []
@@ -462,6 +598,73 @@ def detect_bed_echo(power_vals, time_vals, surf_idx_in_clean, px_per_us, config)
     )
 
     # --- Define Bed Search Start and Minimum Time ---
+    # Primary mode: if user provided absolute bed search window (in μs), try that first
+    bed_start_abs = processing_params.get("bed_search_start_us")
+    bed_end_abs = processing_params.get("bed_search_end_us")
+    if bed_start_abs is not None and bed_end_abs is not None:
+        print(f"INFO: Using configured BED search window {bed_start_abs}-{bed_end_abs} μs (primary)")
+        bed_mask = (time_vals >= bed_start_abs) & (time_vals <= bed_end_abs)
+        if np.any(bed_mask):
+            candidate_times = time_vals[bed_mask]
+            candidate_powers = power_vals[bed_mask]
+            # Find true peaks inside the absolute window and pick according to configured mode
+            from scipy.signal import find_peaks
+
+            peaks_in_window, peak_props = find_peaks(
+                candidate_powers,
+                distance=max(1, us_to_px(processing_params.get("bed_peak_distance_us", 0.1))),
+                prominence=processing_params.get("bed_peak_prominence_db", 1.0),
+                width=(max(1, us_to_px(processing_params.get("bed_min_peak_width_us", 0.05))), None),
+            )
+
+            bed_select_mode = processing_params.get("bed_select_mode", "highest_peak")
+
+            if bed_select_mode == "highest_power":
+                # Raw maximum sample in the absolute window
+                best_local_idx = int(np.argmax(candidate_powers))
+                actual_idx = np.where(bed_mask)[0][best_local_idx]
+            elif bed_select_mode == "highest_peak":
+                # Pick the highest *local peak* (peak maxima returned by find_peaks)
+                if len(peaks_in_window) > 0:
+                    # candidate_powers at peak indices -> select peak with largest amplitude
+                    peak_amplitudes = candidate_powers[peaks_in_window]
+                    sel = int(np.argmax(peak_amplitudes))
+                    best_local_idx = int(peaks_in_window[sel])
+                    actual_idx = np.where(bed_mask)[0][best_local_idx]
+                else:
+                    # No peaks found -> fallback to raw maximum
+                    best_local_idx = int(np.argmax(candidate_powers))
+                    actual_idx = np.where(bed_mask)[0][best_local_idx]
+            else:  # most_prominent
+                # 'most_prominent' selection: choose the most prominent peak found (fall back to raw max)
+                if len(peaks_in_window) > 0:
+                    prominences = peak_props.get("prominences")
+                    if prominences is not None and len(prominences) == len(peaks_in_window):
+                        sel = int(np.argmax(prominences))
+                    else:
+                        sel = int(np.argmax(candidate_powers[peaks_in_window]))
+
+                    best_local_idx = int(peaks_in_window[sel])
+                    actual_idx = np.where(bed_mask)[0][best_local_idx]
+                else:
+                    # No true peaks found; fall back to raw maximum sample in the window
+                    best_local_idx = int(np.argmax(candidate_powers))
+                    actual_idx = np.where(bed_mask)[0][best_local_idx]
+            candidate_time = time_vals[actual_idx]
+            candidate_power = power_vals[actual_idx]
+
+            # When the user explicitly provided an absolute bed search window, make
+            # that window authoritative: prefer the highest/local peak inside the
+            # specified μs range regardless of the configured "bed_min_time_after_surface_us"
+            # or other bed thresholds. If no valid peak or raw-sample candidate exists
+            # inside the absolute window, fall back to the original dynamic detection.
+            # This behavior lets users override other safety checks when they manually
+            # chose an absolute search window.
+            print(
+                f"INFO: Bed candidate selected from absolute window at {candidate_time:.2f} μs, Power {candidate_power:.1f} dB (absolute-window authoritative)"
+            )
+            return actual_idx
+
     bed_search_start_time = decay_confirmed_time + processing_params.get(
         "bed_search_start_offset_us", 2.0
     )

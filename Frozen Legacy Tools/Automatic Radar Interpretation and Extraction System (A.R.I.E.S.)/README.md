@@ -18,6 +18,7 @@
   - [Single Image Processing](#single-image-processing)
   - [Batch Processing](#batch-processing)
 - [Configuration](#configuration)
+  - [Configuration tuning: move tx pulse / surface / bed detection](#configuration-tuning-move-tx-pulse--surface--bed-detection)
 - [Configuration Reference Sheet](#-configuration-reference-sheet)
 - [Core Processing Pipeline](#-core-processing-pipeline)
 - [Output Files](#-output-files)
@@ -29,12 +30,14 @@
 - **Automated Image Processing**: Load and preprocess historical Z-scope radar echograms with adaptive enhancement
 - **Intelligent Feature Detection**: Automatically detect film artifact boundaries, transmitter pulse, and calibration pips
 - **Advanced Echo Tracing**: Multi-scale adaptive algorithms for automatic surface and bed echo detection
-- **Time Domain Calibration**: Precise time-to-depth conversion using calibration pip analysis
+- **Dual Calibration Methods**: Choose between ARIES automatic pip detection or TERRA-style manual 4-point selection
+- **Time Domain Calibration**: Precise time-to-depth conversion using 2μs interval calibration (TERRA methodology)
 - **Coordinate Integration**: Full GPS coordinate interpolation using flight navigation data
-- **Quality Validation**: Automatic validation and parameter optimization across image sequences
+- **Interactive Optimization**: Real-time parameter adjustment with config editing and re-run detection capability
+- **Quality Validation**: Automatic validation and parameter optimization with user approval workflow
 - **Comprehensive Output**: Enhanced CSV export with pixel coordinates, travel times, and ice thickness measurements
-- **Interactive Refinement**: Click-based calibration pip selection with local refinement algorithms
-- **Batch Processing**: Process entire flight directories with adaptive parameter learning
+- **Smart Batch Processing**: Calibration reuse functionality for efficient processing of similar images
+- **Interactive Refinement**: Manual CBD tick selection with filename-based count detection
 - **Modular Architecture**: Separate modules for artifact detection, calibration, feature detection, and visualization
 
 
@@ -95,6 +98,39 @@ pip install numpy scipy opencv-python matplotlib pandas pathlib2
 python -c "import numpy, cv2, matplotlib, pandas, scipy; print('All packages installed successfully!')"
 ```
 
+### Common interpreter name problems (python vs python3)
+
+Some systems use the `python` command, others use `python3` (Linux/macOS), and Windows also supports the Python Launcher `py` which can select versions. If you get "command not found" or packages seem installed for a different interpreter, use these recommendations:
+
+- Check which interpreter is available and its version:
+  - Windows (PowerShell): `py -3 --version` or `python --version`
+  - macOS / Linux: `python3 --version` or `python --version`
+
+- Prefer invoking pip with the same interpreter to avoid installing into a different Python than you run:
+  - `python -m pip install ...` or `python3 -m pip install ...` (use whichever matches your `python` command)
+  - Windows (explicit): `py -3 -m pip install ...`
+
+- Creating and activating venvs safely (examples):
+  - Windows PowerShell (recommended):
+    ```powershell
+    py -3 -m venv .venv
+    .\.venv\Scripts\Activate.ps1
+    py -3 -m pip install --upgrade pip
+    py -3 -m pip install numpy scipy opencv-python matplotlib pandas
+    ```
+  - macOS / Linux:
+    ```bash
+    python3 -m venv .venv
+    source .venv/bin/activate
+    python3 -m pip install --upgrade pip
+    python3 -m pip install numpy scipy opencv-python matplotlib pandas
+    ```
+
+- If activation fails in PowerShell because of execution policy, run as admin once:
+  - `Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser` (see PowerShell docs and use with caution)
+
+Using these patterns ensures the packages are installed into the interpreter you're actually running. If in doubt, try `python -c "import sys; print(sys.executable)"` (or `py -3 -c "import sys; print(sys.executable)"`) to see which binary will run the code.
+
 ### Directory Structure
 ```
 ARIES/
@@ -116,50 +152,77 @@ ARIES/
 
 Process a single Z-scope radar image with automatic feature detection:
 
-```bash
-python main.py <image_path> <output_dir> --nav_file <navigation_file>
+```powershell
+# interactive mode (will prompt for calpip selection unless you pass --non_interactive_pip_x)
+python main.py --output <output_dir> <path\to\zscope_image.tiff>
+
+# non-interactive (supply approximate calpip X coordinate)
+python main.py --output <output_dir> --non_interactive_pip_x 19000 <path\to\zscope_image.tiff>
 ```
 
 **Arguments**:
-- `<image_path>`: Path to radar image file (`.tiff`, `.png`, `.jpg`)
-- `<output_dir>`: Directory for output files and results
-- `<navigation_file>`: Flight navigation CSV file with GPS coordinates
+- `--batch_dir`: Path to directory containing radar image file(s)
+- `--output`: Directory for output files and results
+- `--nav`: Flight navigation CSV file with GPS coordinates
 
 **Example**:
 ```bash
-python main.py F125_Zscope/F125-C0468_0481.tiff output --nav_file F125_Zscope/125.csv
+python main.py --batch_dir F125_Zscope --output output --nav F125_Zscope/125.csv
 ```
 
 ### Batch Processing
 
 Process multiple images in a directory with adaptive parameter learning:
 
-```bash
-python main.py --batch_dir <input_directory> <output_dir> --nav_file <navigation_file>
+```powershell
+# Batch mode example (Windows PowerShell):
+python main.py --batch_dir F125_Zscope --output output\F125_batch --nav F125_Zscope\125.csv
 ```
 
 **Arguments**:
-- `<input_directory>`: Directory containing multiple `.tiff` files
-- `<output_dir>`: Directory for batch processing results
-- `<navigation_file>`: Flight navigation CSV file
+- `--batch_dir`: Directory containing multiple `.tiff` files
+- `--output`: Directory for batch processing results
+- `--nav`: Flight navigation CSV file
 
 **Example**:
 ```bash
-python main.py --batch_dir F125_Zscope output/F125_batch --nav_file F125_Zscope/125.csv
+python main.py --batch_dir F125_Zscope --output output/F125_batch --nav F125_Zscope/125.csv
 ```
 
 ### Interactive Workflow
 
-1. **Script launches** with image preprocessing and feature detection
-2. **Calibration pip selection**: Click on the calibration pip location in the displayed image
-3. **Automatic processing**: ARIES automatically detects surface and bed echoes
-4. **Results display**: View the time-calibrated echogram with detected features
-5. **Output generation**: Enhanced CSV and visualization files are saved automatically
+Note: **Calibration pip selection (calpip) and method choice are prompted up-front** in both single-image interactive mode and batch mode. In single-image mode the program will open a click selector to pick an approximate X-coordinate for calpip when `--non_interactive_pip_x` is not provided. In batch mode the user is first asked to choose a method (ARIES or TERRA), and if ARIES is chosen an initial click-selection is requested on the first image.
+
+1. **Calibration (ARIES or TERRA)** — The workflow begins by asking the user to choose the calibration pip (calpip) method and/or pick the approximate pip location:
+  - Single-image interactive: ClickSelector opens to pick the approximate X-coordinate (unless `--non_interactive_pip_x` is supplied).
+  - Batch mode: The script first asks whether to use ARIES (automatic) or TERRA (manual). ARIES then requires an initial ClickSelector on the first image; TERRA proceeds to 4-point manual selection without an initial area click.
+2. **Image preprocessing** with automatic feature detection and boundary identification (the pipeline reads the whole image file).
+3. **Echo detection & optimization**:
+  - Automatic surface and bed echo detection
+  - Results review with approval dialog
+  - **Choice 1**: Re-run detection with updated configuration (real-time parameter adjustment)
+  - **Choice 2**: Proceed with current results or run guided calibration
+4. **CBD tick selection**: Manually select all CBD positions (count auto-detected from filename range)
+5. **Time-domain calibration**: 2μs interval calibration using the chosen method (ARIES or TERRA)
+6. **Results visualization**: Time-calibrated echogram with detected features
+7. **Enhanced output**: CSV export with coordinates, travel times, and ice thickness
+
+### Batch Processing Workflow
+
+1. **Startup / First image**: At the start of batch mode the user is asked to choose a calpip method (ARIES or TERRA). If a non-interactive X coordinate was supplied (`--non_interactive_pip_x`) the calpip selection step is skipped and that X value is used. If ARIES is chosen and no non-interactive X was supplied, the program will open the ClickSelector on the first image to get an approximate X location. TERRA uses manual 4-point selection and does not require the initial area-click.
+2. **Read & process whole files**: The pipeline then reads the whole image files in the batch directory and applies preprocessing, echo detection and calibration as configured.
+3. **Per-image calpip decision**:
+  - **"y" (new calibration)**: Prompt to select a new calpip for the current image using the chosen method
+  - **"n" (reuse calibration)**: Use the previous calpip values (approx X or stored calibration) and skip new selection
+  - **"q" (quit)**: Exit batch processing
+4. **Adaptive processing**: The chosen calibration method is preserved for the remainder of the batch unless explicitly changed
+5. **Efficiency optimization**: Reusing calibration data speeds up processing for similar images
 
 ### Command Line Options
 
-- `--nav_file`: Navigation CSV file path (required for coordinate interpolation)
-- `--batch_dir`: Enable batch processing mode for multiple files
+- `--batch_dir`: Directory containing radar image files (required)
+- `--output`: Output directory for processed results (required)
+- `--nav`: Navigation CSV file path (required for coordinate interpolation)
 - `--config`: Custom configuration file path (optional)
 
 
@@ -173,6 +236,36 @@ ARIES uses JSON configuration files to control processing parameters:
 - **Physical constants**: `config/physical_constants.json` - Radar wave velocity, ice properties
 
 You can customize detection thresholds, search windows, and output settings by editing these files.
+
+### Configuration tuning: move transmitter pulse / surface / bed detection
+
+If you need to shift where the algorithms search (for the transmitter pulse, the surface echo, or the bed echo), change the following keys in `config/default_config.json`.
+
+- Transmitter pulse (where to look for the TX pulse near the top of the image):
+  - `transmitter_pulse_params.search_height_ratio` — controls how far down (vertical fraction or multiplier depending on image crop) the processor will search for the pulse. Decrease to search higher, increase to search deeper.
+  - `transmitter_pulse_params.peak_prominence` — detection sensitivity; reduce to make detection easier for weak pulses, raise to ignore noisy peaks.
+  - `transmitter_pulse_params.fallback_depth_ratio` — fallback vertical position when no peak is confidently detected.
+
+  Example: to search closer to the top of the file try lowering `search_height_ratio` (e.g., reduce from 1.2 to 0.5–0.8 in heavily-cropped images).
+
+- Surface echo (how far below the transmitter pulse to start looking for the ice surface):
+  - `echo_tracing_params.surface_detection.search_start_offset_px` — pixels below the transmitter pulse where surface search begins. Lower this value if the surface echo appears closer to the transmit pulse, raise it if the surface is deeper.
+  - `echo_tracing_params.surface_detection.search_depth_px` — vertical size (px) of the search window for the surface echo — increase to allow deeper search.
+  - `echo_tracing_params.surface_detection.peak_prominence` — strength threshold for surface echo detection.
+
+  Example: if the detected surface is consistently too low, decrease `search_start_offset_px` (e.g. from 300 to 250 or 200). If the surface is missed, lower `peak_prominence` to 5–15.
+
+- Bed echo (how far below the surface the algorithm looks for the bed):
+  - `echo_tracing_params.bed_detection.search_start_offset_from_surface_px` — start searching this many pixels below the detected surface.
+  - `echo_tracing_params.bed_detection.search_end_offset_from_z_boundary_px` — how close to image bottom to stop searching.
+  - `echo_tracing_params.bed_detection.peak_prominence` — bed echo detection threshold; lower for weak returns.
+
+  Example: for thicker ice, increase `search_start_offset_from_surface_px` (e.g., from 260 to 400–800); for noisy images, raise `peak_prominence` to avoid false positives.
+
+Notes, diagnostics and iteration:
+- Use the visualization flags in `default_config.json` to enable debug plots (e.g. `visualize_tx_pulse_detection`, `visualize_pip_detection`, `save_intermediate_plots`) to inspect the search windows and detections.
+- Make single-image changes and re-run interactive mode until you find settings that work — then save a config copy and use `--config` to process a batch consistently.
+- For GUI-based calpip picking (TERRA method) use the interactive picker; ARIES method requires initial approximate X position and will try automatic pip detection.
 
 ---
 
@@ -292,29 +385,53 @@ You can customize detection thresholds, search windows, and output settings by e
 - **Validation**: Automatic validation using expected pulse characteristics
 - **Fallback Mechanisms**: Robust handling of difficult detection cases
 
-### 3. Calibration Pip Detection
-- **Interactive Selection**: User clicks approximate calibration pip location
-- **Local Refinement**: Advanced computer vision algorithms for precise tick detection
-- **Multi-Approach Detection**: Primary and aggressive detection methods with ranking
-- **Time Calibration**: Conversion from pixels to microseconds using tick spacing
+### 3. CBD Tick Mark Selection
+- **Filename-Based Count**: Automatically determines number of CBDs from filename (e.g., C0218_C0231 = 14 CBDs)
+- **Manual Positioning**: User manually clicks each CBD tick mark position for maximum accuracy
+- **Dynamic Color Coding**: Each selected CBD gets a unique color marker and sequential numbering
+- **No Interpolation**: Uses exact clicked positions, eliminating spacing calculation errors
 
-### 4. Automated Echo Tracing
-- **Surface Echo Detection**: 
+### 4. Dual Calibration Pip Methods
+
+#### ARIES Automatic Method:
+- **Click Selection**: User clicks approximate calibration pip location
+- **Automatic Detection**: Computer vision algorithms detect individual tick marks (~33px spacing)
+- **Local Refinement**: Advanced algorithms for precise position detection
+- **Multi-Approach**: Primary and aggressive detection methods with ranking
+
+#### TERRA Manual Method:
+- **4-Point Selection**: Manual selection of exactly 4 calibration points
+- **Windowed Interface**: PyQt5-based picker with image navigation and zoom
+- **Major Calpip Lines**: Focuses on major calibration lines (~137px spacing)
+- **2μs Intervals**: Each major line represents 2μs travel time (TERRA methodology)
+- **Slider Navigation**: Easy navigation through large radar images
+
+#### Method Selection:
+- **User Choice**: Select method at start of processing session
+- **Batch Consistency**: Chosen method preserved throughout batch processing
+- **Calibration Reuse**: Option to reuse previous calibration data for similar images
+
+### 5. Automated Echo Tracing & Optimization
+- **Initial Detection**: 
   - Multi-scale adaptive filtering and enhancement
-  - Configurable search window offset from transmitter pulse
-  - Peak prominence analysis with edge handling
-  - Continuous trace validation and smoothing
-- **Bed Echo Detection**:
-  - Search window defined relative to detected surface
-  - Enhanced contrast processing for weak bed returns
-  - Robust detection in presence of noise and artifacts
-  - Quality metrics and confidence scoring
+  - Configurable search parameters with default settings
+  - Peak prominence analysis for surface and bed interfaces
+- **Interactive Review**:
+  - Visual results display with coverage statistics
+  - User approval dialog: satisfied vs. optimize parameters
+  - **Real-time parameter editing**: Direct config file modification
+  - **Re-run capability**: Test new settings immediately
+- **Optimization Options**:
+  - **Option 1**: Interactive point selection (guided calibration)
+  - **Option 2**: Direct configuration file editing with system editor
+- **Quality Metrics**: Coverage statistics and confidence scoring for validation
 
-### 5. Data Integration & Export
-- **Time Domain Calibration**: Precise one-way travel time calculations using detected pips
-- **Coordinate Interpolation**: High-resolution lat/lon interpolation from flight navigation
-- **Physical Calculations**: Ice thickness in meters using electromagnetic wave propagation
-- **Quality Assurance**: Automatic validation and parameter optimization for batch processing
+### 6. Data Integration & Export
+- **Time Domain Calibration**: Precise calibration using 2μs interval methodology (TERRA-compatible)
+- **Two-Way Travel Time**: Ice thickness calculated using round-trip electromagnetic wave propagation
+- **Coordinate Interpolation**: High-resolution lat/lon interpolation from flight navigation data
+- **Enhanced Output**: Complete pixel coordinates, travel times, and ice thickness measurements
+- **Batch Efficiency**: Calibration reuse and method consistency for streamlined processing
 
 --- 
 ## 📊 Output Files
@@ -329,7 +446,7 @@ Contains full-resolution measurements with the following columns:
 - **CBD**: Control Block Distance navigation reference (where available)
 - **Surface Depth (μs)**: One-way travel time to ice surface interface
 - **Bed Depth (μs)**: One-way travel time to ice bed interface  
-- **Ice Thickness (m)**: Calculated ice thickness using electromagnetic wave propagation
+- **Ice Thickness (m)**: Calculated ice thickness using two-way travel time methodology (like TERRA)
 
 ### 2. Calibrated Visualization Plots
 - **`{filename}_picked.png`**: Main time-calibrated echogram with:
